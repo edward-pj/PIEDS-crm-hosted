@@ -229,6 +229,11 @@ def is_runnable(job, now=None) -> tuple[bool, str]:
         return False, f"outside the sending window ({start:02d}:00-{end:02d}:00)"
     if job.campaign.status != CampaignStatus.ACTIVE.value:
         return False, f"campaign is {job.campaign.status}"
+    # The root as well. Pausing "Ignite" has to stop every member's
+    # sub-campaign, or the emergency brake stops one queue out of fifteen.
+    root = job.campaign.parent
+    if root is not None and root.status != CampaignStatus.ACTIVE.value:
+        return False, f"campaign {root.title!r} is {root.status}"
     return True, ""
 
 
@@ -288,8 +293,12 @@ def claim_due(member, agent_id="", limit=5, now=None) -> list[ScheduledSend]:
 
     candidates = (
         ScheduledSend.objects
-        .select_for_update(skip_locked=True)
-        .select_related("campaign")
+        # `of=("self",)` locks only scheduled_sends. Two reasons, and the
+        # second is not optional: we have no business locking campaign rows
+        # here, and `campaign__parent` is nullable, so select_related makes it a
+        # LEFT OUTER JOIN -- and Postgres refuses FOR UPDATE across one.
+        .select_for_update(skip_locked=True, of=("self",))
+        .select_related("campaign", "campaign__parent")
         .filter(
             member=member,
             status__in=[ScheduleStatus.PENDING.value, ScheduleStatus.HELD.value],

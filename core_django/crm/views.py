@@ -18,7 +18,15 @@ from shared.enums import (
     ScheduleStatus,
 )
 
-from .forms import BulkEditForm, CampaignForm, ContactForm, CsvUploadForm, NoteForm, TokenForm
+from .forms import (
+    BulkEditForm,
+    CampaignForm,
+    ContactForm,
+    CsvUploadForm,
+    FooterForm,
+    NoteForm,
+    TokenForm,
+)
 from .models import (
     ApiToken,
     Campaign,
@@ -64,11 +72,21 @@ def _base(request, **extra):
 
 @member_required
 def home(request):
+    # Roots, counted across every sub-campaign -- see campaign_list for why.
     funnels = (
-        Campaign.objects.annotate(
-            sent=Count("mailings", filter=Q(mailings__status=MailingStatus.SENT.value)),
-            failed=Count("mailings", filter=Q(mailings__status=MailingStatus.FAILED.value)),
-            drafted=Count("mailings", filter=Q(mailings__status=MailingStatus.DRAFT.value)),
+        Campaign.objects.filter(parent__isnull=True).annotate(
+            sent=Count(
+                "root_mailings",
+                filter=Q(root_mailings__status=MailingStatus.SENT.value),
+            ),
+            failed=Count(
+                "root_mailings",
+                filter=Q(root_mailings__status=MailingStatus.FAILED.value),
+            ),
+            drafted=Count(
+                "root_mailings",
+                filter=Q(root_mailings__status=MailingStatus.DRAFT.value),
+            ),
         )
         .order_by("-created_at")[:6]
     )
@@ -411,9 +429,19 @@ def contact_import_confirm(request):
 
 @member_required
 def campaign_list(request):
-    campaigns = Campaign.objects.annotate(
-        sent=Count("mailings", filter=Q(mailings__status=MailingStatus.SENT.value)),
-        failed=Count("mailings", filter=Q(mailings__status=MailingStatus.FAILED.value)),
+    # Roots only, and the totals count mail sent under EVERY sub-campaign of
+    # each -- `root_mailings`, not `mailings`. Listing sub-campaigns here would
+    # show fifteen near-identical rows per campaign, and counting only
+    # `mailings` would report zero for a campaign the team had worked all week.
+    campaigns = Campaign.objects.filter(parent__isnull=True).annotate(
+        sent=Count(
+            "root_mailings",
+            filter=Q(root_mailings__status=MailingStatus.SENT.value),
+        ),
+        failed=Count(
+            "root_mailings",
+            filter=Q(root_mailings__status=MailingStatus.FAILED.value),
+        ),
     )
     return render(request, "crm/campaign_list.html", _base(request, campaigns=campaigns))
 
@@ -421,7 +449,17 @@ def campaign_list(request):
 @member_required
 def campaign_detail(request, pk):
     campaign = get_object_or_404(Campaign, pk=pk)
-    mailings = campaign.mailings.select_related("contact", "sent_by").order_by("-created_at")
+
+    # For a root, this is the whole team's mail under it -- every member's
+    # sub-campaign included. `campaign.mailings` would show only what was sent
+    # under the root directly, which after Phase 2 is usually nothing at all,
+    # and the page would report a busy campaign as idle.
+    mailings = (
+        CampaignMailing.objects
+        .filter(root_campaign=campaign.parent or campaign)
+        .select_related("contact", "sent_by", "campaign")
+        .order_by("-created_at")
+    )
 
     counts = {
         status: mailings.filter(status=status).count()
@@ -672,12 +710,14 @@ def _send_queue(member, campaign):
 
     Excludes anyone already SENT or DRAFT rather than filtering in Python: the
     pool is the whole team's and a member's assignment can be hundreds of rows.
+    Scoped to the ROOT campaign, so a contact a teammate has already reached
+    never appears in this member's queue at all.
     FAILED is deliberately NOT excluded -- claim_batch reuses a failed row, so
     those are genuinely still sendable and hiding them makes a retry impossible
     from this screen.
     """
     already = CampaignMailing.objects.filter(
-        campaign=campaign,
+        root_campaign=campaign.parent or campaign,
         status__in=[MailingStatus.SENT.value, MailingStatus.DRAFT.value],
     ).values_list("contact_id", flat=True)
 
@@ -692,21 +732,27 @@ def _send_queue(member, campaign):
 
 @member_required
 def send(request):
+    # ROOTS only. A member picks the team's campaign; which sub-campaign their
+    # mail goes out under is bookkeeping, and offering fifteen near-identical
+    # titles would invite sending under somebody else's footer.
     campaigns = Campaign.objects.filter(
-        status=CampaignStatus.ACTIVE.value
+        status=CampaignStatus.ACTIVE.value, parent__isnull=True
     ).order_by("title")
 
     campaign_id = request.POST.get("campaign") or request.GET.get("campaign")
     campaign = None
     if campaign_id:
-        campaign = Campaign.objects.filter(
-            pk=campaign_id, status=CampaignStatus.ACTIVE.value
-        ).first()
+        campaign = campaigns.filter(pk=campaign_id).first()
     elif campaigns.count() == 1:
         campaign = campaigns.first()
 
     queue = _send_queue(request.member, campaign) if campaign else Contact.objects.none()
     preflight = None
+    my_footer_text = ""
+    if campaign:
+        my_footer_text = campaign_svc.sub_campaign_for(
+            campaign, request.member
+        ).footer
 
     if request.method == "POST" and campaign:
         selected = request.POST.getlist("contact_ids")
@@ -729,9 +775,16 @@ def send(request):
                 )
                 return redirect("crm:gmail_settings")
 
+            # Created here rather than at assignment time: a member should not
+            # need setting up before they can send, and doing it lazily means no
+            # bookkeeping when someone joins mid-campaign. The mail then goes
+            # out with their footer and, crucially, claims the contact against
+            # the ROOT so no teammate can mail them again.
+            sub = campaign_svc.sub_campaign_for(campaign, request.member)
+
             try:
                 job = schedule_svc.create(
-                    campaign_id=campaign.id,
+                    campaign_id=sub.id,
                     member=request.member,
                     contact_ids=selected,
                     scheduled_at=timezone.now(),
@@ -760,5 +813,42 @@ def send(request):
         queue=queue[:500],
         queue_total=queue.count() if campaign else 0,
         preflight=preflight,
+        my_footer_text=my_footer_text,
         gmail_connected=gmail_svc.has_usable_credential(request.member),
+    ))
+
+
+@member_required
+def my_footer(request, pk):
+    """Edit your own footer on one root campaign.
+
+    The sub-campaign is created on demand: a member should not have to be
+    "set up" before they can personalise their sign-off, and creating it lazily
+    means no bookkeeping when someone joins mid-campaign.
+    """
+    root = get_object_or_404(Campaign, pk=pk, parent__isnull=True)
+    sub = campaign_svc.sub_campaign_for(root, request.member)
+
+    form = FooterForm(
+        request.POST or None, instance=sub, is_lead=is_lead(request.member)
+    )
+    if request.method == "POST" and form.is_valid():
+        form.save()
+        messages.success(request, "Footer saved.")
+        return redirect("crm:campaign_detail", pk=root.pk)
+
+    # Rendered against a real contact so the preview is what a recipient gets,
+    # not the template. Falls back to the raw footer when there is nobody to
+    # render against yet.
+    sample = Contact.objects.filter(assigned_to=request.member).first()
+    preview, preview_error = None, None
+    if sample:
+        try:
+            preview = render_mail(sub, sample)
+        except MissingVariables as exc:
+            preview_error = str(exc)
+
+    return render(request, "crm/footer_form.html", _base(
+        request, form=form, root=root, sub=sub,
+        preview=preview, preview_error=preview_error, sample=sample,
     ))

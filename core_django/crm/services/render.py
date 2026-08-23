@@ -10,7 +10,16 @@ can never disagree.
 from dataclasses import dataclass
 
 from .campaigns import ALLOWED_VARIABLES, PLACEHOLDER_RE
-from .richtext import to_html, to_plain
+from .richtext import to_fragment, to_plain, wrap_document
+
+#: RFC 3676 signature delimiter: "-- " on its own line. Mail clients recognise
+#: it and collapse or grey what follows, which is exactly what a footer is.
+PLAIN_FOOTER_SEPARATOR = "\n\n-- \n"
+
+#: The HTML equivalent. A rule rather than a "--" so it reads as a divider.
+HTML_FOOTER_SEPARATOR = (
+    '\n<br>\n<hr style="border:none;border-top:1px solid #ddd;margin:16px 0">\n'
+)
 
 
 class MissingVariables(Exception):
@@ -52,9 +61,19 @@ def render(campaign, contact) -> Rendered:
     a skipped contact, and a blank company in a subject line advertises that the
     mail was blasted. Callers surface these as MISSING_VARS so the data can be
     fixed before sending.
+
+    **The message comes from the root, the footer from `campaign` itself.** A
+    sub-campaign owns nothing but its footer, so passing one here yields the
+    team's wording with that member's sign-off. Passing a root yields the same
+    thing with no footer, which is what a root campaign mailed directly is.
+
+    Footers deliberately carry no placeholders -- see `validate_footer` in
+    campaigns.py for why that restriction earns its keep.
     """
+    root = campaign.parent or campaign
+
     ctx = contact_context(contact)
-    used = set(PLACEHOLDER_RE.findall(f"{campaign.mail_sub}\n{campaign.mail_body}"))
+    used = set(PLACEHOLDER_RE.findall(f"{root.mail_sub}\n{root.mail_body}"))
 
     unknown = used - ALLOWED_VARIABLES
     if unknown:
@@ -68,17 +87,33 @@ def render(campaign, contact) -> Rendered:
         return PLACEHOLDER_RE.sub(lambda m: ctx[m.group(1)], text)
 
     # Substitute first, convert second. In the default mode that means every
-    # contact value passes through to_html's escaping, so a company name with an
-    # `&` in it cannot break the markup. The cost is that a contact field
-    # literally containing `[x](y)` would turn into a link -- accepted.
+    # contact value passes through the escaping in to_fragment, so a company
+    # name with an `&` in it cannot break the markup. The cost is that a contact
+    # field literally containing `[x](y)` would turn into a link -- accepted.
     #
     # With `is_html` on, that escaping is gone and a contact field containing
     # markup is trusted. Acceptable: contacts are typed in by the same team that
     # writes the campaigns, and the CSV importer is lead-only.
-    raw = bool(getattr(campaign, "is_html", False))
-    body = substitute(campaign.mail_body)
+    raw = bool(getattr(root, "is_html", False))
+    body = substitute(root.mail_body)
+
+    footer = (getattr(campaign, "footer", "") or "").strip()
+    footer_raw = bool(getattr(campaign, "footer_is_html", False))
+
+    plain = to_plain(body, raw=raw)
+    # Each part is converted with ITS OWN raw flag and only the results are
+    # joined. Converting the joined text instead would escape a raw-HTML footer
+    # into visible tags whenever the body happened to be plain text -- and
+    # joining two to_html() results would nest two complete HTML documents,
+    # which is why to_fragment and wrap_document exist separately.
+    fragment = to_fragment(body, raw=raw)
+
+    if footer:
+        plain += PLAIN_FOOTER_SEPARATOR + to_plain(footer, raw=footer_raw)
+        fragment += HTML_FOOTER_SEPARATOR + to_fragment(footer, raw=footer_raw)
+
     return Rendered(
-        subject=substitute(campaign.mail_sub),
-        body=to_plain(body, raw=raw),
-        body_html=to_html(body, raw=raw),
+        subject=substitute(root.mail_sub),
+        body=plain,
+        body_html=wrap_document(fragment),
     )

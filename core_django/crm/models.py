@@ -366,6 +366,24 @@ class Campaign(TimeStampedModel):
     """A reusable mail template plus its lifecycle state.
 
     Status transitions are NOT enforced here -- see services/campaigns.py.
+
+    **Campaigns are exactly two levels deep.** A *root* campaign owns the
+    subject, the body and the status -- what the team is saying. A *sub-campaign*
+    belongs to one member, has one root, and owns exactly one thing: that
+    member's footer. Nothing else about a sub-campaign is editable, because
+    everything else is the team's message rather than the sender's.
+
+    The reason is a bug this shape exists to make impossible. Each member used
+    to get their own top-level campaign so they could have their own footer, and
+    `uniq_campaign_contact` is scoped to ONE campaign -- so once Aarav had mailed
+    a company under his, Kabir's campaign had no row for that contact and he
+    could mail them again under a different banner. Rooting the sub-campaigns
+    and adding `uniq_root_campaign_contact` makes the guarantee team-wide, which
+    is what it always should have been.
+
+    Depth is exactly two, never a tree: a root has no parent, a sub-campaign's
+    parent is always a root. Three levels would make "which footer applies"
+    ambiguous, and the constraint below enforces it.
     """
 
     title = models.CharField(max_length=200)
@@ -392,18 +410,90 @@ class Campaign(TimeStampedModel):
         TeamMember, on_delete=models.SET_NULL, null=True, related_name="campaigns"
     )
 
+    #: NULL for a root campaign. PROTECT because deleting a root out from under
+    #: its sub-campaigns would orphan every mailing rooted to it.
+    parent = models.ForeignKey(
+        "self", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="sub_campaigns",
+        help_text="The root campaign this personalises. Blank for a root campaign.",
+    )
+
+    #: Whose sub-campaign this is. NULL on a root: a root belongs to the team.
+    owner = models.ForeignKey(
+        TeamMember, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="sub_campaigns",
+    )
+
+    #: The ONLY field a sub-campaign owner may edit. Appended to the root's body
+    #: at render time; see services/render.py.
+    footer = models.TextField(
+        blank=True,
+        help_text="Your sign-off. Appended to the campaign body in your mail only.",
+    )
+
+    #: Independent of the root's `is_html` -- a plain-text body can carry a
+    #: styled footer and vice versa, which is why render.py converts the two
+    #: parts separately. Lead-only in the form: richtext's no-sanitiser design
+    #: rests on raw HTML being written only by leads.
+    footer_is_html = models.BooleanField(
+        default=False,
+        help_text="Write the footer as raw HTML. Leads only.",
+    )
+
     class Meta:
         db_table = "campaigns"
         ordering = ["-created_at"]
+        constraints = [
+            # One sub-campaign per member per root. Two would make "which
+            # footer" ambiguous and would let one member hold two claims on the
+            # same contact.
+            models.UniqueConstraint(
+                fields=["parent", "owner"],
+                name="uniq_parent_owner",
+                condition=models.Q(parent__isnull=False),
+            ),
+            # A sub-campaign has an owner; a root does not. Without this a root
+            # could acquire an owner and quietly start behaving like a
+            # sub-campaign of nothing.
+            models.CheckConstraint(
+                condition=(
+                    models.Q(parent__isnull=True, owner__isnull=True)
+                    | models.Q(parent__isnull=False, owner__isnull=False)
+                ),
+                name="campaign_parent_and_owner_agree",
+            ),
+        ]
 
     def __str__(self):
         return f"{self.title} [{self.status}]"
+
+    @property
+    def root(self):
+        """The campaign that owns the message. Itself, if it is a root."""
+        return self.parent or self
+
+    @property
+    def is_root(self) -> bool:
+        return self.parent_id is None
 
 
 class CampaignMailing(TimeStampedModel):
     """One mail, to one contact, for one campaign. The unit of idempotency."""
 
     campaign = models.ForeignKey(Campaign, on_delete=models.PROTECT, related_name="mailings")
+
+    #: The root of `campaign`, denormalised so the database can enforce
+    #: uniqueness across every member's sub-campaign at once. Set automatically
+    #: in save(); no caller passes it.
+    #:
+    #: NOT `related_name="mailings"` -- that belongs to `campaign` above, and
+    #: every funnel aggregate in views.py depends on it meaning that.
+    #: NOT NULL is load-bearing, not tidiness -- see the constraint below.
+    root_campaign = models.ForeignKey(
+        Campaign, on_delete=models.PROTECT, related_name="root_mailings",
+        db_index=True,
+    )
+
     contact = models.ForeignKey(Contact, on_delete=models.PROTECT, related_name="mailings")
     sent_by = models.ForeignKey(TeamMember, on_delete=models.PROTECT, related_name="mailings")
 
@@ -445,17 +535,44 @@ class CampaignMailing(TimeStampedModel):
         db_table = "campaign_mailings"
         ordering = ["-created_at"]
         constraints = [
-            # THE idempotency guarantee. A double-click, a retry, or two agents
-            # racing all collide here at the database rather than putting a
-            # second copy of the same mail in a prospect's inbox.
+            # THE idempotency guarantee, now team-wide. One mail per contact per
+            # ROOT campaign, so Aarav's sub-campaign and Kabir's cannot both
+            # reach the same prospect under the same banner.
+            #
+            # This is the constraint that fixes the duplicate-mail bug. It is
+            # only worth anything because root_campaign is NOT NULL: Postgres
+            # unique indexes treat NULLs as distinct, so two rows with a null
+            # root and the same contact would BOTH insert. See check_db.
+            models.UniqueConstraint(
+                fields=["root_campaign", "contact"],
+                name="uniq_root_campaign_contact",
+            ),
+            # Implied by the one above -- a collision here is a collision there
+            # too -- but kept deliberately. It is what check_db has always
+            # asserted and what test_constraints.py pins, and a redundant index
+            # is far cheaper than a weakened guarantee.
             models.UniqueConstraint(
                 fields=["campaign", "contact"], name="uniq_campaign_contact"
-            )
+            ),
         ]
         indexes = [
             models.Index(fields=["campaign", "status"]),
             models.Index(fields=["sent_by", "sent_at"]),
         ]
+
+    def save(self, *args, **kwargs):
+        """Derive `root_campaign` rather than trusting the caller.
+
+        Every call site would otherwise have to remember, and forgetting would
+        not fail -- it would insert a NULL root, which the unique index ignores.
+        A silently unprotected row is exactly the failure this field exists to
+        prevent, so it is not something to leave to discipline.
+        """
+        if self.root_campaign_id is None and self.campaign_id is not None:
+            self.root_campaign_id = self.campaign.parent_id or self.campaign_id
+            if "update_fields" in kwargs and kwargs["update_fields"] is not None:
+                kwargs["update_fields"] = list(kwargs["update_fields"]) + ["root_campaign"]
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.campaign_id} -> {self.contact_id} [{self.status}]"
@@ -622,6 +739,26 @@ class FollowUpRule(TimeStampedModel):
         return f"{self.campaign_id} -> {self.follow_up_id} after {self.delay_days}d"
 
     def clean(self):
+        """A follow-up campaign must be a SIBLING root, never a child.
+
+        Follow-ups work by mailing the same contact under a second campaign.
+        `uniq_root_campaign_contact` forbids that within one root -- so a
+        follow-up sharing a root with the campaign it chases can never queue
+        anything: every job it creates would be 100% skipped, silently, forever.
+
+        Making them sibling roots also earns something. "Ignite" and "Ignite
+        follow-up" are two roots, so follow-up dedupe is team-wide for free.
+        """
         from django.core.exceptions import ValidationError
+
         if self.campaign_id and self.campaign_id == self.follow_up_id:
             raise ValidationError("A campaign cannot follow up on itself.")
+
+        if self.campaign_id and self.follow_up_id:
+            if self.campaign.root.id == self.follow_up.root.id:
+                raise ValidationError(
+                    "A follow-up must be a separate root campaign, not part of "
+                    "the same one. One contact may only be mailed once per root "
+                    "campaign, so a follow-up rooted here could never send "
+                    "anything."
+                )

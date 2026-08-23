@@ -91,7 +91,12 @@ def test_silence_past_the_delay_is_followed_up(rule, first, second, member):
 
     jobs = svc.queue_follow_ups(rule)
     assert len(jobs) == 1
-    assert jobs[0].campaign == second
+    # The SENDER'S sub-campaign of the follow-up root, not the root itself.
+    # Queueing the root would send every follow-up with the wrong footer -- or
+    # none -- so a follow-up would arrive signed by somebody the prospect has
+    # never heard from.
+    assert jobs[0].campaign.parent == second
+    assert jobs[0].campaign.owner == member
     assert jobs[0].contact_ids == [str(contact.id)]
     assert jobs[0].member == member
 
@@ -144,7 +149,7 @@ def test_a_paused_follow_up_campaign_queues_nothing(rule, first, second, member)
     assert svc.queue_follow_ups(rule) == []
 
 
-def test_each_original_sender_gets_their_own_job(rule, first, member):
+def test_each_original_sender_gets_their_own_job(rule, first, second, member):
     """A follow-up must leave the same mailbox as the mail it is chasing, or it
     arrives from a stranger with no thread behind it."""
     other = TeamMember.objects.create(
@@ -157,6 +162,12 @@ def test_each_original_sender_gets_their_own_job(rule, first, member):
     jobs = svc.queue_follow_ups(rule)
     assert {j.member for j in jobs} == {member, other}
     assert all(len(j.contact_ids) == 1 for j in jobs)
+    # Each job under its own sender's sub-campaign, so each follow-up carries
+    # the footer of the person whose thread it continues. This assertion is the
+    # tripwire: without it the sub-campaign resolution can be dropped from
+    # queue_follow_ups and every test here still passes.
+    assert {j.campaign.owner for j in jobs} == {member, other}
+    assert all(j.campaign.parent_id == second.id for j in jobs)
 
 
 # --------------------------------------------------------- reply bookkeeping

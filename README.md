@@ -292,6 +292,7 @@ never gets a mailing row, so that query would leave a job running forever.
 | Field | Type | Notes |
 |---|---|---|
 | `campaign` / `contact` / `sent_by` | FK | **all `PROTECT`** |
+| `root_campaign` | FK, **NOT NULL** | the root of `campaign`, derived in `save()`. What makes the guarantee team-wide. |
 | `mail_thread_id` / `mail_message_id` | Char(120) | from Gmail |
 | `status` | Char(8) | `draft` / `sent` / `failed` |
 | `rendered_subject` / `rendered_body` | Text | **snapshot of what actually went out** |
@@ -301,16 +302,96 @@ never gets a mailing row, so that query would leave a job running forever.
 | `sent_at` | DateTime | |
 
 ```
-constraints: UNIQUE(campaign, contact)  name="uniq_campaign_contact"
+constraints: UNIQUE(root_campaign, contact)  name="uniq_root_campaign_contact"
+             UNIQUE(campaign, contact)       name="uniq_campaign_contact"
 indexes:     (campaign, status), (sent_by, sent_at)
 ```
 
-Two deliberate choices here:
+**Why there are two.** `uniq_campaign_contact` was the original guarantee and it
+had a hole: it is scoped to ONE campaign. Every member had their own campaign so
+they could have their own footer — so once Aarav had mailed a company under his,
+Kabir's campaign held no row for that contact and he could mail the same prospect
+again under a different banner. `uniq_root_campaign_contact` closes it: one mail
+per contact per **root** campaign, across every member's sub-campaign at once.
+
+The old one is kept even though the new one implies it. It costs an index and it
+is what `check_db` has always asserted; a redundant index is far cheaper than a
+weakened guarantee.
+
+**`NOT NULL` on `root_campaign` is load-bearing, not tidiness.** Postgres unique
+indexes treat NULLs as distinct, so with a nullable column two rows with a null
+root and the same contact would *both* insert. A nullable root is not a weaker
+guarantee — it is no guarantee. `check_db` asserts the nullability directly
+against `information_schema`, not just the index.
+
+Four more deliberate choices here:
 
 - **`rendered_*` snapshots.** Campaign templates change. Without these we could
   never answer "what did we actually send this person?"
 - **`PROTECT` on `contact`.** A contact that has ever been mailed cannot be
   deleted — that would destroy the record. This is why archiving exists.
+- **`root_campaign` is derived in `save()`, not passed by callers.** Forgetting
+  to pass it would not fail loudly; it would insert a NULL root, which the unique
+  index ignores. A silently unprotected row is exactly what the field exists to
+  prevent, so it is not left to discipline.
+- **`related_name="root_mailings"`, not `mailings`.** That name belongs to
+  `campaign`, and every funnel aggregate depends on it meaning that. Note the
+  flip side: a campaign page counting `campaign.mailings` now reports almost
+  nothing, because mail goes out under sub-campaigns — the dashboard, the
+  campaign list and the campaign detail page all count `root_mailings`.
+
+### 5.0 Campaign hierarchy: roots and sub-campaigns
+
+Campaigns are **exactly two levels deep**.
+
+A **root** campaign owns the subject, the body, the variables and the status —
+what the team is saying, and whether it may be said at all. A **sub-campaign**
+belongs to one member, has one root, and owns exactly one thing: that member's
+`footer`. Nothing else about it is editable, because everything else is the
+team's message rather than the sender's.
+
+```
+Ignite  (root: subject, body, status, follow-up rules)
+├── Ignite — Kabir   (footer: "Kabir Rao | PIEDS")
+├── Ignite — Ishita  (footer: "Ishita Nair | PIEDS")
+└── Ignite — Aarav   (footer: ...)
+```
+
+- Sub-campaigns are created **on demand**, the first time a member sends or
+  edits their footer. Nobody has to be "set up", and a member joining mid-campaign
+  needs no bookkeeping.
+- A sub-campaign carries **no copy** of the subject or body. `render()` reads both
+  from the root; duplicating them would create a second copy that goes quietly
+  stale the moment a lead edits the root.
+- **Status lives on the root.** Pausing "Ignite" stops every member's queue at
+  once — `load_sendable_campaign` and `scheduling.is_runnable` both check the
+  root as well as the sub-campaign. Without that, the emergency brake would stop
+  one queue out of fifteen.
+- **A follow-up campaign must be a sibling root, never a child.** Follow-ups work
+  by mailing the same contact under a second campaign, which uniqueness forbids
+  within one root — so a follow-up rooted under the campaign it chases could
+  never queue anything, silently, forever. `FollowUpRule.clean()` refuses it. As a
+  bonus, "Ignite" and "Ignite follow-up" being two roots makes follow-up dedupe
+  team-wide for free.
+- **Migrations must never create a parent link.** The backfill in `0011` is safe
+  precisely because every pre-existing campaign is its own root, making
+  `root_campaign_id := campaign_id` the identity map on a pair already guaranteed
+  unique. Reparenting two existing campaigns under one root would collapse every
+  contact they both mailed onto one `(root, contact)` pair — so
+  `campaigns.set_parent()` runs a collision query and refuses first, naming the
+  contacts. There is no database-level way to catch this at reparent time: the
+  constraint fires on the *next* insert, long after the damage.
+
+**Footers carry no `{{ }}` placeholders**, and that restriction protects
+something. `validate_template` demands *set equality* between `var_list` and the
+placeholders actually used — a member's footer saying `{{ company }}` would be
+"undeclared" against a `var_list` on a root they cannot edit, forcing that
+equality down to a subset check and destroying the typo detector the function
+exists for. A footer is a signature.
+
+`footer_is_html` is **lead-only**, for the reason in §5.1: `richtext.py` ships
+without an HTML sanitiser on the explicit grounds that raw HTML is written only
+by leads. Members get the markdown-lite subset, which already handles links.
 
 ### 5.1 Links and HTML in a body
 
@@ -1137,7 +1218,7 @@ cd core_django
 ../.venv/bin/python manage.py makemigrations
 ```
 
-`check_db` asserts that `uniq_campaign_contact` and `contacts_tags_gin` exist,
+`check_db` asserts the indexes, the hierarchy invariants and the token key,
 that `SELECT … FOR UPDATE` actually works over this connection, and that you are
 not on the transaction pooler. It exits non-zero on failure, so it can be a
 release gate. Sample output:
@@ -1146,6 +1227,7 @@ release gate. Sample output:
 database : localhost:5432/ignite_crm
 server   : PostgreSQL 16.14
   ok     campaign_mailings.uniq_campaign_contact
+  ok     campaign_mailings.uniq_root_campaign_contact
   ok     contacts.contacts_tags_gin
   ok     SELECT ... FOR UPDATE
 

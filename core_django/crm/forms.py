@@ -1,9 +1,10 @@
 from django import forms
+from django.core.exceptions import ValidationError
 
 from shared.enums import ContactLifecycle
 
 from .models import Campaign, Contact, ContactNote, TeamMember
-from .services.campaigns import ALLOWED_VARIABLES, extract_placeholders
+from .services.campaigns import ALLOWED_VARIABLES, extract_placeholders, validate_footer
 from .services.contacts import clean_tags
 from .services.richtext import validate_links, validate_markup
 from .services.permissions import can_set_lifecycle, is_lead
@@ -105,6 +106,48 @@ class CampaignForm(BasecoatMixin, forms.ModelForm):
         if commit:
             campaign.save()
         return campaign
+
+
+class FooterForm(BasecoatMixin, forms.ModelForm):
+    """The one thing a sub-campaign owner may edit.
+
+    Not a cut-down CampaignForm: a sub-campaign owner has no business touching
+    the subject, the body or the variables, and a form that merely hides those
+    fields still round-trips them through a crafted POST.
+    """
+
+    class Meta:
+        model = Campaign
+        fields = ["footer", "footer_is_html"]
+        widgets = {"footer": forms.Textarea(attrs={"rows": 6})}
+        labels = {"footer_is_html": "Footer contains HTML"}
+
+    def __init__(self, *args, is_lead=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.is_lead = is_lead
+        if not is_lead:
+            # Removed, not disabled. richtext.py ships without an HTML sanitiser
+            # on the explicit grounds that raw HTML is written only by leads --
+            # so letting a member set this would quietly invalidate that
+            # argument, and a disabled field is not a control.
+            self.fields.pop("footer_is_html")
+
+    def clean_footer(self):
+        footer = self.cleaned_data.get("footer") or ""
+        try:
+            validate_footer(footer)
+        except ValidationError as exc:
+            raise forms.ValidationError(exc.messages)
+        for problem in validate_links(footer):
+            raise forms.ValidationError(problem)
+        return footer
+
+    def clean(self):
+        cleaned = super().clean()
+        if cleaned.get("footer_is_html"):
+            for problem in validate_markup(cleaned.get("footer") or ""):
+                self.add_error("footer", problem)
+        return cleaned
 
 
 class ContactForm(BasecoatMixin, forms.ModelForm):

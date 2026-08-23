@@ -114,14 +114,21 @@ class Claimed:
 
 def load_sendable_campaign(campaign_id) -> Campaign:
     try:
-        campaign = Campaign.objects.get(id=campaign_id)
+        campaign = Campaign.objects.select_related("parent").get(id=campaign_id)
     except (Campaign.DoesNotExist, ValueError, TypeError):
         raise CampaignNotSendable(f"No campaign {campaign_id}")
-    if campaign.status != CampaignStatus.ACTIVE.value:
-        raise CampaignNotSendable(
-            f"Campaign {campaign.title!r} is {campaign.status}; only "
-            f"{CampaignStatus.ACTIVE.value} campaigns can be mailed."
-        )
+
+    # Both the sub-campaign AND its root must be active. Checking only the
+    # sub-campaign would mean pausing "Ignite" left fifteen sub-campaigns
+    # happily draining their queues -- and the emergency brake is the whole
+    # reason status exists.
+    for c in {campaign.id: campaign, **({campaign.parent.id: campaign.parent}
+                                        if campaign.parent else {})}.values():
+        if c.status != CampaignStatus.ACTIVE.value:
+            raise CampaignNotSendable(
+                f"Campaign {c.title!r} is {c.status}; only "
+                f"{CampaignStatus.ACTIVE.value} campaigns can be mailed."
+            )
     return campaign
 
 
@@ -149,9 +156,13 @@ def preflight(campaign, member, contact_ids) -> list[dict]:
     """Dry run. Writes nothing; tells the user exactly what will happen."""
     # FAILED is deliberately absent: those are re-claimable now, so counting
     # them as "already mailed" would make the dry run disagree with the send.
+    # Scoped to the ROOT, not to this campaign: a contact another member has
+    # already mailed under their own sub-campaign is not sendable, and a dry run
+    # that says otherwise is worse than no dry run.
+    root = campaign.parent or campaign
     already = set(
         CampaignMailing.objects.filter(
-            campaign=campaign,
+            root_campaign=root,
             contact_id__in=contact_ids,
             status__in=[MailingStatus.SENT.value, MailingStatus.DRAFT.value],
         ).values_list("contact_id", flat=True)
@@ -198,6 +209,7 @@ def claim_batch(campaign, member, contact_ids, *, cc="", bcc="") -> tuple[list[C
     cc = parse_copy_addresses(cc)
     bcc = parse_copy_addresses(bcc)
     from_name = member.display_name
+    root = campaign.parent or campaign
 
     budget = DAILY_SEND_CAP - sent_last_24h(member)
 
@@ -254,31 +266,57 @@ def claim_batch(campaign, member, contact_ids, *, cc="", bcc="") -> tuple[list[C
                 # may be sitting in a prospect's inbox with the report lost, so
                 # it must go through reconcile against Gmail first. That is the
                 # whole reason DRAFT and FAILED are different states.
+                #
+                # Scoped to the ROOT, not to this campaign. That is the fix for
+                # the duplicate-mail bug: without it, a row under Aarav's
+                # sub-campaign is invisible to Kabir's claim and he mails the
+                # same prospect again under his own footer.
                 existing = (
                     CampaignMailing.objects
                     .select_for_update()
-                    .filter(campaign=campaign, contact=contact)
+                    .filter(root_campaign=root, contact=contact)
                     .first()
                 )
 
                 if existing and existing.status != MailingStatus.FAILED.value:
-                    skipped.append(
-                        Skipped(
-                            str(contact.id), contact.email, contact.full_name,
-                            "already has a mailing (sent)"
-                            if existing.status == MailingStatus.SENT.value
-                            else "already has a mailing (claimed but unresolved; "
-                                 "run Resolve stranded drafts)",
-                            ALREADY_MAILED,
+                    # Who it belongs to changes what the operator should do, so
+                    # say which. "Someone else already mailed them" is a fact
+                    # about the team; "you already mailed them" is a fact about
+                    # you, and showing the wrong one gets a bug filed.
+                    theirs = existing.sent_by_id != member.id
+                    if existing.status == MailingStatus.SENT.value:
+                        reason = (
+                            f"already mailed by {existing.sent_by.name} for this "
+                            f"campaign" if theirs else "already has a mailing (sent)"
                         )
+                    else:
+                        reason = (
+                            f"claimed by {existing.sent_by.name} and unresolved"
+                            if theirs else
+                            "already has a mailing (claimed but unresolved; "
+                            "run Resolve stranded drafts)"
+                        )
+                    skipped.append(
+                        Skipped(str(contact.id), contact.email, contact.full_name,
+                                reason, ALREADY_MAILED)
                     )
                     continue
 
                 if existing:
+                    # A FAILED row is taken over rather than left for whoever
+                    # first tried it. A mail nobody received is not really
+                    # theirs, and refusing here would mean one member's transient
+                    # Gmail error silently removed a prospect from the team's
+                    # reachable pool until that same member retried.
+                    #
+                    # `campaign` is rewritten too, so the mail goes out with THIS
+                    # member's footer rather than the original sender's.
+                    #
                     # Re-render rather than reuse the old snapshot: the template
                     # or the contact may have been fixed since it failed, and
                     # that fix is usually WHY someone is retrying.
                     existing.status = MailingStatus.DRAFT.value
+                    existing.campaign = campaign
                     existing.sent_by = member
                     existing.rendered_subject = rendered.subject
                     existing.rendered_body = rendered.body
@@ -313,13 +351,29 @@ def claim_batch(campaign, member, contact_ids, *, cc="", bcc="") -> tuple[list[C
                 Skipped(str(contact_id), "", "", "contact no longer exists", FAILED)
             )
             continue
-        except IntegrityError:
+        except IntegrityError as exc:
+            # A genuine race: two claims for the same contact landed at once and
+            # the database refused the second. That is the guarantee working.
+            #
+            # WHICH constraint fired says something different to the operator,
+            # so read it off psycopg3's diagnostics rather than reporting one
+            # sentence for both. "Someone else on your team already mailed this
+            # contact" is a different fact from "you already claimed them", and
+            # a member shown the wrong one files a bug.
+            constraint = getattr(
+                getattr(exc.__cause__, "diag", None), "constraint_name", ""
+            ) or ""
+            if constraint == "uniq_root_campaign_contact":
+                reason = "a teammate claimed this contact for the same campaign first"
+            else:
+                reason = "already has a mailing"
+
             contact = Contact.objects.filter(id=contact_id).first()
             skipped.append(
                 Skipped(str(contact_id),
                         contact.email if contact else "",
                         contact.full_name if contact else "",
-                        "already has a mailing", ALREADY_MAILED)
+                        reason, ALREADY_MAILED)
             )
             continue
 

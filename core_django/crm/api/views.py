@@ -64,12 +64,18 @@ def contacts(request):
 
     mailed = set()
     if campaign_id:
-        mailed = set(
-            CampaignMailing.objects.filter(
-                campaign_id=campaign_id,
-                status__in=[MailingStatus.SENT.value, MailingStatus.DRAFT.value],
-            ).values_list("contact_id", flat=True)
-        )
+        # Root-scoped, so a contact a teammate has already reached under their
+        # own sub-campaign shows as mailed here too. Scoping to this campaign
+        # alone would show them as available and then refuse them at send time,
+        # which is the exact confusion the grey-out exists to prevent.
+        campaign = Campaign.objects.filter(id=campaign_id).first()
+        if campaign is not None:
+            mailed = set(
+                CampaignMailing.objects.filter(
+                    root_campaign_id=campaign.parent_id or campaign.id,
+                    status__in=[MailingStatus.SENT.value, MailingStatus.DRAFT.value],
+                ).values_list("contact_id", flat=True)
+            )
 
     # Archived contacts are excluded outright rather than shown greyed: they are
     # refused by claim_batch anyway, and offering them would only invite a
@@ -477,10 +483,15 @@ def reply_report(request, mailing_id):
     # answered. Pull them back out of the queue.
     if result.get("status") == "replied":
         try:
-            mailing = CampaignMailing.objects.select_related("campaign").get(id=mailing_id)
+            mailing = CampaignMailing.objects.select_related(
+                "campaign", "campaign__parent"
+            ).get(id=mailing_id)
         except (CampaignMailing.DoesNotExist, ValueError, TypeError):
             return JsonResponse(result)
-        for rule in mailing.campaign.follow_up_rules.filter(is_active=True):
+        # Rules hang off ROOT campaigns; the mail went out under the sender's
+        # sub-campaign. Reading rules off `mailing.campaign` would find none.
+        root = mailing.campaign.parent or mailing.campaign
+        for rule in root.follow_up_rules.filter(is_active=True):
             result["pulled_from_queue"] = followup_svc.cancel_pending_for(
                 mailing.contact_id, rule.follow_up_id
             )

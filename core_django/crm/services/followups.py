@@ -20,6 +20,7 @@ setting REPLIED stays opt-in per rule (FollowUpRule.mark_replied).
 from datetime import timedelta
 
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from crm.models import CampaignMailing, FollowUpRule, ScheduledSend
@@ -30,6 +31,7 @@ from shared.enums import (
     MailingStatus,
 )
 
+from . import campaigns as campaign_svc
 from . import scheduling
 
 #: Stop re-reading threads forever. A prospect who has not answered in a month
@@ -57,7 +59,15 @@ def threads_to_check(member, limit=50, now=None):
         .exclude(mail_thread_id="")
         # Only threads a live rule actually cares about; checking the rest would
         # spend Gmail quota to learn something nobody asked for.
-        .filter(campaign__follow_up_rules__is_active=True)
+        #
+        # Rules hang off ROOT campaigns, but mail goes out under a member's
+        # sub-campaign -- so this has to look through `parent` as well. Matching
+        # only on `campaign` would silently stop finding any thread sent under a
+        # sub-campaign, which is to say all of them.
+        .filter(
+            Q(campaign__follow_up_rules__is_active=True)
+            | Q(campaign__parent__follow_up_rules__is_active=True)
+        )
         .select_related("contact", "campaign")
         .distinct()
         .order_by("reply_checked_at", "sent_at")[:limit]
@@ -100,14 +110,20 @@ def record_reply_scan(mailing_id, member, *, replied: bool, now=None) -> dict:
 
 
 def due_for_follow_up(rule, now=None):
-    """Mailings under `rule` that have gone unanswered long enough."""
+    """Mailings under `rule` that have gone unanswered long enough.
+
+    Matched on `root_campaign`, not `campaign`: a rule is attached to a root,
+    but every mail it is chasing went out under some member's sub-campaign.
+    Filtering on `campaign` would find only mail sent under the root directly --
+    which, once sub-campaigns exist, is none of it.
+    """
     now = now or timezone.now()
     cutoff = now - timedelta(days=rule.delay_days)
 
     return (
         CampaignMailing.objects
         .filter(
-            campaign=rule.campaign,
+            root_campaign=rule.campaign.root,
             status=MailingStatus.SENT.value,
             replied_at__isnull=True,
             followed_up_at__isnull=True,
@@ -134,6 +150,8 @@ def queue_follow_ups(rule, now=None) -> list:
     if not rule.is_active or rule.follow_up.status != CampaignStatus.ACTIVE.value:
         return []
 
+    follow_up_root = rule.follow_up.parent or rule.follow_up
+
     by_sender: dict = {}
     for mailing in due_for_follow_up(rule, now):
         by_sender.setdefault(mailing.sent_by, []).append(mailing)
@@ -144,11 +162,15 @@ def queue_follow_ups(rule, now=None) -> list:
             continue
 
         # A contact already mailed under the follow-up campaign would be
-        # refused by uniq_campaign_contact anyway; filtering here keeps the job
-        # honest about its own size instead of reporting a batch of skips.
+        # refused by uniq_root_campaign_contact anyway; filtering here keeps the
+        # job honest about its own size instead of reporting a batch of skips.
+        #
+        # Scoped to the ROOT: whether a teammate already sent this follow-up
+        # under their own sub-campaign is exactly as disqualifying as whether
+        # this sender did.
         already = set(
             CampaignMailing.objects.filter(
-                campaign=rule.follow_up,
+                root_campaign=follow_up_root,
                 contact_id__in=[m.contact_id for m in mailings],
             ).values_list("contact_id", flat=True)
         )
@@ -156,8 +178,16 @@ def queue_follow_ups(rule, now=None) -> list:
         if not contact_ids:
             continue
 
+        # THE sender's own sub-campaign of the follow-up root, created on
+        # demand -- not the root itself. Queueing the root would send every
+        # follow-up with no footer, or with whichever footer happened to be on
+        # the root, rather than the footer of the person whose thread it
+        # continues. A follow-up arriving signed by someone else is worse than
+        # no follow-up.
+        sender_campaign = campaign_svc.sub_campaign_for(follow_up_root, sender)
+
         job = scheduling.create(
-            campaign_id=rule.follow_up_id,
+            campaign_id=sender_campaign.id,
             member=sender,
             contact_ids=contact_ids,
             # `now` and not "in a minute": the scheduler's own window decides
@@ -208,9 +238,20 @@ def cancel_pending_for(contact_id, campaign_id) -> int:
     key = str(contact_id)
     removed = 0
 
-    for job in ScheduledSend.objects.filter(campaign_id=campaign_id).exclude(
-        status__in=TERMINAL_SCHEDULE_STATUSES
-    ):
+    # Accepts either a root or a sub-campaign, and matches every job under that
+    # root. Jobs are queued against the SENDER'S sub-campaign, so filtering on
+    # the follow-up root alone -- which is what every caller has -- would match
+    # nothing at all, and we would chase people who had already replied.
+    from crm.models import Campaign
+
+    target = Campaign.objects.filter(id=campaign_id).first()
+    if target is None:
+        return 0
+    root_id = target.parent_id or target.id
+
+    for job in ScheduledSend.objects.filter(
+        Q(campaign_id=root_id) | Q(campaign__parent_id=root_id)
+    ).exclude(status__in=TERMINAL_SCHEDULE_STATUSES):
         ids = [str(c) for c in job.contact_ids]
         # Only the part not yet attempted; rewriting sent history would be a lie.
         head, tail = ids[:job.cursor], ids[job.cursor:]

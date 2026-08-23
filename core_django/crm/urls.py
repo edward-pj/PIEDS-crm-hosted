@@ -27,6 +27,7 @@ urlpatterns = [
     path("campaigns/<uuid:pk>/", views.campaign_detail, name="campaign_detail"),
     path("campaigns/<uuid:pk>/edit/", views.campaign_edit, name="campaign_edit"),
     path("campaigns/<uuid:pk>/status/", views.campaign_transition, name="campaign_transition"),
+    path("campaigns/<uuid:pk>/footer/", views.my_footer, name="my_footer"),
 
     path("schedules/", views.schedule_list, name="schedule_list"),
     path("schedules/<uuid:pk>/cancel/", views.schedule_cancel, name="schedule_cancel"),

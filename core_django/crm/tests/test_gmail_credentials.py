@@ -35,6 +35,20 @@ def token_key(settings):
     return KEY_A
 
 
+@pytest.fixture(autouse=True)
+def always_in_the_send_window(settings):
+    """Neutralise quiet hours.
+
+    Without this the tick tests pass in the afternoon and fail after 19:00 IST,
+    because a job due outside the delivery window is correctly parked as HELD.
+    A test whose result depends on what time it is run is worse than no test.
+    Setting start == end disables the window; see scheduling.py::_window.
+    """
+    settings.SCHEDULE_WINDOW_START = 0
+    settings.SCHEDULE_WINDOW_END = 0
+    settings.SCHEDULE_WINDOW_DAYS = [0, 1, 2, 3, 4, 5, 6]
+
+
 @pytest.fixture
 def member():
     return TeamMember.objects.create(

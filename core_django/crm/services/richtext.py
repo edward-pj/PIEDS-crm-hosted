@@ -12,10 +12,13 @@ untrusted to sanitise and no sanitiser dependency to keep current. That rests
 entirely on to_html() escaping every piece it did not itself write. Do not
 weaken it.
 
-RAW MODE (`raw=True`, driven by the campaign's `is_html` checkbox) deliberately
-suspends that: the body is passed through untouched so a lead can write a
-footer, a divider, or inline styling. The trust boundary moves rather than
-disappearing -- campaign editing is @lead_required, and the only place the CRM
+RAW MODE (`raw=True`, driven by the campaign's `is_html` checkbox, or a
+sub-campaign's `footer_is_html`) deliberately suspends that: the text is passed
+through untouched so a lead can write a divider or inline styling. The trust
+boundary moves rather than disappearing -- campaign editing is @lead_required
+and `footer_is_html` is removed from the form for non-leads for exactly this
+reason (see forms.py::FooterForm; a member's footer is always escaped). The only
+place the CRM
 renders this HTML is the campaign_detail preview, inside a `sandbox=""` iframe
 that cannot run script. Mail clients strip script themselves. CampaignForm
 additionally refuses `<script>` and inline event handlers, so the sandboxed
@@ -126,8 +129,15 @@ def to_plain(text: str, raw: bool = False) -> str:
     return plain
 
 
-def to_html(text: str, raw: bool = False) -> str:
-    """Render the body as a full HTML document.
+def to_fragment(text: str, raw: bool = False) -> str:
+    """Convert one piece of body text to an HTML *fragment* -- no document.
+
+    Split out of `to_html` so a body and a footer can be converted SEPARATELY,
+    each with its own `raw` flag, and only then joined. Converting them together
+    is not an option: a plain-text body would escape a raw-HTML footer into
+    visible tags. Joining two `to_html` results is not an option either -- each
+    is a complete `<!doctype html>...</html>` document, so the result would be
+    one document nested inside another.
 
     Default mode: every run of ordinary text, every link label, and every href
     is escaped before it is interpolated, and newlines become <br>. That is what
@@ -138,6 +148,11 @@ def to_html(text: str, raw: bool = False) -> str:
     second set inserted underneath. Link syntax still works in both modes, and
     its href is still escaped either way; there is no reason to hand-write an
     anchor just because the rest of the body is HTML.
+
+    **The newline conversion belongs in here, not in the caller.** It used to run
+    over the whole joined body. Joining first and converting after would inject
+    <br> into a raw-HTML footer whose author deliberately did not want them --
+    which is the entire distinction `raw` exists to express.
     """
     out: list[str] = []
     cursor = 0
@@ -154,14 +169,28 @@ def to_html(text: str, raw: bool = False) -> str:
 
     out.append(passthrough(text[cursor:]))
 
-    body = "".join(out)
+    fragment = "".join(out)
     if not raw:
         # Escaping first and converting newlines second: the reverse would let a
         # <br> we just inserted be escaped back into visible text.
-        body = body.replace("\n", "<br>\n")
+        fragment = fragment.replace("\n", "<br>\n")
+    return fragment
 
+
+def wrap_document(fragment: str) -> str:
+    """Wrap a fragment (or several, already joined) as a full HTML document."""
     return (
         '<!doctype html><html><body style="' + _BODY_STYLE + '">\n'
-        + body
+        + fragment
         + "\n</body></html>"
     )
+
+
+def to_html(text: str, raw: bool = False) -> str:
+    """Render one body as a full HTML document.
+
+    Kept with its original signature AND byte-identical output: the campaign
+    preview, the link tests and the header tests all pin this, and there was no
+    reason to change what goes out at the same time as adding footers.
+    """
+    return wrap_document(to_fragment(text, raw))

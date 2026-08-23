@@ -20,9 +20,56 @@ REQUIRED_INDEXES = [
         "it, a retry or two racing agents can mail a prospect twice.",
     ),
     (
+        "campaign_mailings",
+        "uniq_root_campaign_contact",
+        "The TEAM-WIDE idempotency guarantee: one mail per (root campaign, "
+        "contact). Without it two members' sub-campaigns can each mail the same "
+        "prospect under the same banner.",
+    ),
+    (
         "contacts",
         "contacts_tags_gin",
         "GIN index backing tag filtering. Missing it is slow, not unsafe.",
+    ),
+]
+
+#: Invariants that no index can express. Each is (label, SQL, why) where the SQL
+#: must return zero rows.
+REQUIRED_INVARIANTS = [
+    (
+        "campaign_mailings.root_campaign_id is NOT NULL",
+        """SELECT 1 FROM information_schema.columns
+           WHERE table_name = 'campaign_mailings'
+             AND column_name = 'root_campaign_id'
+             AND is_nullable = 'YES'""",
+        "Postgres unique indexes treat NULLs as DISTINCT, so a nullable root "
+        "makes uniq_root_campaign_contact vacuous: two rows with a null root "
+        "and the same contact would both insert. A nullable root is not a "
+        "weaker guarantee, it is no guarantee.",
+    ),
+    (
+        "no mailing without a root",
+        "SELECT 1 FROM campaign_mailings WHERE root_campaign_id IS NULL LIMIT 1",
+        "Rows predating the backfill are unprotected by the constraint. Run "
+        "migration 0011.",
+    ),
+    (
+        "campaigns are at most two levels deep",
+        """SELECT 1 FROM campaigns child
+           JOIN campaigns parent ON child.parent_id = parent.id
+           WHERE parent.parent_id IS NOT NULL LIMIT 1""",
+        "A three-level campaign makes 'which footer applies' ambiguous and "
+        "breaks the root derivation in CampaignMailing.save().",
+    ),
+    (
+        "every root_campaign matches its campaign's root",
+        """SELECT 1 FROM campaign_mailings m
+           JOIN campaigns c ON m.campaign_id = c.id
+           WHERE m.root_campaign_id IS DISTINCT FROM COALESCE(c.parent_id, c.id)
+           LIMIT 1""",
+        "A mailing rooted somewhere other than its campaign's actual root. This "
+        "is what a botched reparent looks like, and the constraint will not "
+        "catch it until the NEXT insert.",
     ),
 ]
 
@@ -51,6 +98,14 @@ class Command(BaseCommand):
                 else:
                     self.stdout.write(self.style.ERROR(f"  MISSING {table}.{index}"))
                     failures.append(f"{table}.{index} — {why}")
+
+            for label, sql, why in REQUIRED_INVARIANTS:
+                cur.execute(sql)
+                if cur.fetchone():
+                    self.stdout.write(self.style.ERROR(f"  VIOLATED {label}"))
+                    failures.append(f"{label} — {why}")
+                else:
+                    self.stdout.write(self.style.SUCCESS(f"  ok     {label}"))
 
             # A transaction-mode pooler silently breaks SELECT ... FOR UPDATE
             # semantics the send path relies on. Surface the port so a bad
