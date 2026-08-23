@@ -1,16 +1,20 @@
 """Who is using the CRM, and how they proved it.
 
-Two doors, one per batch, because the two batches have different problems:
+**One door: Google, restricted to the BITS domain.** Everyone authenticates the
+same way, and the identity is verified against Google's signed `id_token` and
+its `hd` claim rather than against a string anyone can type.
 
-- **Batch 2024 (leads)** pick their name from a list. No password. Every lead
-  runs the CRM on their own laptop against the shared database, so the only
-  person who can reach that form is the person holding the machine. A password
-  here would protect nothing that the laptop's own lock screen doesn't.
+There used to be a second door -- batch 2024 picked a name from a dropdown, no
+password -- justified on the grounds that every lead ran the CRM on their own
+laptop, so the only person who could reach the form was the person holding the
+machine. That argument was sound then and is simply false now: on a public
+hostname the form is reachable by anyone on the internet, the leads' UUIDs were
+rendered into the page as `<option value>`, and picking a name made you a lead.
+It was deleted rather than hidden behind a setting, because a setting leaves the
+code one misconfigured environment variable away from exactly that.
 
-- **Batch 2025** sign in with Google, restricted to the BITS domain. They were
-  going to authenticate with Google anyway -- the sending agent already refuses
-  to run unless the Gmail session matches the member -- so this reuses an
-  identity they must prove regardless, rather than inventing a second one.
+The replacement for "a new person needs access" is the join code, not a
+dropdown. Until that lands, a lead adds members through /admin/.
 
 Identity is a session key holding a TeamMember id. Django's `User` model is no
 longer consulted for the CRM at all; it survives only for `/admin/`.
@@ -22,7 +26,6 @@ from django.conf import settings
 from django.urls import reverse
 
 from crm.models import TeamMember
-from shared.enums import LEAD_BATCH
 
 #: The session key. A TeamMember UUID as a string.
 SESSION_KEY = "member_id"
@@ -73,20 +76,6 @@ def current_member(request) -> TeamMember | None:
     return member
 
 
-def name_login_allowed(member: TeamMember) -> bool:
-    """Only leads may sign in by name.
-
-    Batch 2025 goes through Google because `sent_by` attribution follows the
-    contacts assigned to them; letting anyone claim that identity from a
-    dropdown would make the audit trail a suggestion.
-    """
-    return bool(member and member.is_active and member.batch == LEAD_BATCH)
-
-
-def name_login_choices():
-    return TeamMember.objects.filter(batch=LEAD_BATCH, is_active=True).order_by("name")
-
-
 # --- google ----------------------------------------------------------------
 
 
@@ -94,12 +83,22 @@ def google_enabled() -> bool:
     return bool(settings.GOOGLE_OAUTH_CLIENT_ID and settings.GOOGLE_OAUTH_CLIENT_SECRET)
 
 
+def hosted_domain() -> str:
+    """The domain shown on the login page. Display only -- the check is on `hd`."""
+    return settings.GOOGLE_OAUTH_HOSTED_DOMAIN or ""
+
+
 def _flow(request):
     from google_auth_oauthlib.flow import Flow
 
-    # Redirect URIs are http://localhost:8000/... in this deployment shape --
-    # every member runs the CRM on their own machine. oauthlib rejects plain
-    # http by default, and Google returns scopes in its own order.
+    # The redirect URI is built from the incoming request, so it is the public
+    # https:// URL in production and http://localhost:8000/... in development.
+    # oauthlib rejects plain http, hence the DEBUG-only relaxation; Google
+    # returns scopes in its own order, hence the other.
+    #
+    # `build_absolute_uri` reads the scheme from SECURE_PROXY_SSL_HEADER, which
+    # settings.py only sets when DEBUG is off. Deploying behind a TLS proxy with
+    # DEBUG=True therefore produces an http:// redirect URI that Google rejects.
     if settings.DEBUG:
         os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
     os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")

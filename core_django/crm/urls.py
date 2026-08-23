@@ -17,6 +17,8 @@ urlpatterns = [
     path("contacts/<uuid:pk>/archive/", views.contact_archive, name="contact_archive"),
     path("contacts/<uuid:pk>/delete/", views.contact_delete, name="contact_delete"),
 
+    path("send/", views.send, name="send"),
+
     path("assign/", views.assign, name="assign"),
     path("assign/apply/", views.assign_apply, name="assign_apply"),
 
@@ -28,6 +30,10 @@ urlpatterns = [
 
     path("schedules/", views.schedule_list, name="schedule_list"),
     path("schedules/<uuid:pk>/cancel/", views.schedule_cancel, name="schedule_cancel"),
+
+    path("settings/gmail/", views.gmail_settings, name="gmail_settings"),
+    path("settings/gmail/connect/", views.gmail_connect, name="gmail_connect"),
+    path("settings/gmail/disconnect/", views.gmail_disconnect, name="gmail_disconnect"),
 
     path("members/", views.member_list, name="member_list"),
     path("members/<uuid:pk>/sender-name/", views.member_sender_name, name="member_sender_name"),

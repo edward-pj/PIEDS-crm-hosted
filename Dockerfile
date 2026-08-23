@@ -34,8 +34,39 @@ RUN chmod +x ./docker/*.sh
 # Baked into the image so a container never needs a writable static dir.
 # DJANGO_DEBUG is forced off here only so collectstatic picks the hashed
 # manifest storage; it does not affect runtime, which reads the real env.
-RUN DJANGO_DEBUG=False python core_django/manage.py collectstatic --noinput
+#
+# The two throwaway values are for this RUN only. settings.py refuses to import
+# with DEBUG off and either a dev SECRET_KEY or no DATABASE_URL, and collectstatic
+# imports settings even though it touches neither. They are deliberately NOT ENV:
+# a real secret baked into a layer lives forever in the image history, and a real
+# DATABASE_URL defaulted into the image is precisely the silent-wrong-database
+# failure those guards exist to prevent.
+RUN DJANGO_DEBUG=False \
+    DJANGO_SECRET_KEY=build-only-never-used-at-runtime \
+    DATABASE_URL=postgres://build:build@127.0.0.1:5432/build \
+    python core_django/manage.py collectstatic --noinput
+
+# Nothing here needs root, and a hosted container is worth the two lines. Done
+# after collectstatic so the build can still write staticfiles/.
+RUN useradd --create-home --uid 10001 appuser
+USER appuser
 
 EXPOSE 8000 8111
 
-CMD ["./docker/entrypoint-crm.sh"]
+# The full argv lives in the image, not only in docker-compose.yml -- `docker run
+# ignite-crm` used to exec the entrypoint with no arguments, so its final
+# `exec "$@"` ran nothing and the container exited silently. A hosting platform
+# starts the image exactly that way.
+#
+# Routed through `sh -c` on purpose: PORT is injected by the platform at RUN
+# time, and a JSON-array CMD performs no variable expansion. A server listening
+# on the wrong port presents as "deploy succeeded, site unreachable", with
+# nothing in the logs to say why.
+CMD ["./docker/entrypoint-crm.sh", "sh", "-c", \
+     "exec gunicorn config.wsgi:application \
+        --chdir /app/core_django \
+        --bind 0.0.0.0:${PORT:-8000} \
+        --workers ${WEB_CONCURRENCY:-2} \
+        --threads ${WEB_THREADS:-4} \
+        --timeout ${WEB_TIMEOUT:-120} \
+        --access-logfile -"]

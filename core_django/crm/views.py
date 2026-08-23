@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.contrib import messages
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.core.paginator import Paginator
@@ -9,6 +10,7 @@ from django.utils import timezone
 from django.views.decorators.http import require_POST
 
 from shared.enums import (
+    BLOCKED_LIFECYCLES,
     TERMINAL_SCHEDULE_STATUSES,
     CampaignStatus,
     ContactLifecycle,
@@ -17,8 +19,20 @@ from shared.enums import (
 )
 
 from .forms import BulkEditForm, CampaignForm, ContactForm, CsvUploadForm, NoteForm, TokenForm
-from .models import ApiToken, Campaign, CampaignMailing, Contact, ScheduledSend, TeamMember
+from .models import (
+    ApiToken,
+    Campaign,
+    CampaignMailing,
+    Contact,
+    GmailCredential,
+    ScheduledSend,
+    TeamMember,
+)
 from .services import assignment, importer
+from .services import mailing
+from .services import gmail as gmail_svc
+from .services import gmail_oauth
+from .services import secrets as token_store
 from .services import scheduling as schedule_svc
 from .services import campaigns as campaign_svc
 from .services import contacts as contact_svc
@@ -591,3 +605,160 @@ def token_revoke(request, pk):
     token.revoke()
     messages.success(request, f"Revoked token {token.key_prefix}… for {token.member.name}.")
     return redirect("crm:member_list")
+
+
+# ------------------------------------------------------------------- gmail
+# Connecting Gmail is deliberately its own screen rather than part of signing
+# in. See services/gmail_oauth.py for why the two consents are separate.
+
+
+@member_required
+def gmail_settings(request):
+    credential = GmailCredential.objects.filter(member=request.member).first()
+    return render(request, "crm/gmail_settings.html", _base(
+        request,
+        credential=credential,
+        connected=bool(credential and credential.is_usable),
+        google_configured=bool(
+            settings.GOOGLE_OAUTH_CLIENT_ID and settings.GOOGLE_OAUTH_CLIENT_SECRET
+        ),
+        key_configured=token_store.is_configured(),
+        scopes=gmail_svc.SCOPES,
+    ))
+
+
+@member_required
+@require_POST
+def gmail_connect(request):
+    if not (settings.GOOGLE_OAUTH_CLIENT_ID and settings.GOOGLE_OAUTH_CLIENT_SECRET):
+        messages.error(request, "Google OAuth is not configured on this deployment.")
+        return redirect("crm:gmail_settings")
+
+    # Checked before sending anyone to Google: without a key we could complete
+    # the whole consent dance and then be unable to store the result, which
+    # would look to the member like Google had refused them.
+    if not token_store.is_configured():
+        messages.error(
+            request,
+            "GMAIL_TOKEN_KEY is not set on this deployment, so a Gmail grant "
+            "cannot be stored securely. Ask a lead to set it.",
+        )
+        return redirect("crm:gmail_settings")
+
+    return redirect(gmail_oauth.authorization_url(request, request.member))
+
+
+@member_required
+@require_POST
+def gmail_disconnect(request):
+    if gmail_oauth.disconnect(request.member):
+        messages.success(
+            request,
+            "Gmail disconnected. Access was also revoked with Google, so the "
+            "stored token no longer works anywhere.",
+        )
+    else:
+        messages.info(request, "Gmail was not connected.")
+    return redirect("crm:gmail_settings")
+
+
+# -------------------------------------------------------------------- send
+# The screen the whole migration is for: sign in, see what you have to mail,
+# press one button. Replaces local_agent/templates/index.html.
+
+
+def _send_queue(member, campaign):
+    """This member's contacts that are still mailable for this campaign.
+
+    Excludes anyone already SENT or DRAFT rather than filtering in Python: the
+    pool is the whole team's and a member's assignment can be hundreds of rows.
+    FAILED is deliberately NOT excluded -- claim_batch reuses a failed row, so
+    those are genuinely still sendable and hiding them makes a retry impossible
+    from this screen.
+    """
+    already = CampaignMailing.objects.filter(
+        campaign=campaign,
+        status__in=[MailingStatus.SENT.value, MailingStatus.DRAFT.value],
+    ).values_list("contact_id", flat=True)
+
+    return (
+        member.assigned_contacts
+        .filter(is_archived=False)
+        .exclude(lifecycle__in=BLOCKED_LIFECYCLES)
+        .exclude(id__in=already)
+        .order_by("company", "first_name")
+    )
+
+
+@member_required
+def send(request):
+    campaigns = Campaign.objects.filter(
+        status=CampaignStatus.ACTIVE.value
+    ).order_by("title")
+
+    campaign_id = request.POST.get("campaign") or request.GET.get("campaign")
+    campaign = None
+    if campaign_id:
+        campaign = Campaign.objects.filter(
+            pk=campaign_id, status=CampaignStatus.ACTIVE.value
+        ).first()
+    elif campaigns.count() == 1:
+        campaign = campaigns.first()
+
+    queue = _send_queue(request.member, campaign) if campaign else Contact.objects.none()
+    preflight = None
+
+    if request.method == "POST" and campaign:
+        selected = request.POST.getlist("contact_ids")
+        action = request.POST.get("action")
+
+        if not selected:
+            messages.error(request, "Select at least one contact.")
+
+        elif action == "preflight":
+            # Writes nothing. Worth its own button because the alternative is
+            # discovering a missing {{ company }} on the fourteenth mail.
+            preflight = mailing.preflight(campaign, request.member, selected)
+
+        elif action == "send":
+            if not gmail_svc.has_usable_credential(request.member):
+                messages.error(
+                    request,
+                    "Connect Gmail before sending — the CRM sends from your own "
+                    "mailbox and has no permission to yet.",
+                )
+                return redirect("crm:gmail_settings")
+
+            try:
+                job = schedule_svc.create(
+                    campaign_id=campaign.id,
+                    member=request.member,
+                    contact_ids=selected,
+                    scheduled_at=timezone.now(),
+                    cc=request.POST.get("cc", ""),
+                    bcc=request.POST.get("bcc", ""),
+                )
+            except (schedule_svc.NotSchedulable, mailing.InvalidCopyAddresses) as exc:
+                messages.error(request, str(exc))
+            else:
+                # Queued rather than sent inside this request, deliberately. A
+                # free instance can be reaped mid-request, and a send that dies
+                # halfway leaves claimed contacts stranded. Queued work survives
+                # the tab being closed, the laptop being shut, and the container
+                # being restarted.
+                messages.success(
+                    request,
+                    f"{job.total} mail(s) queued. They send from your Gmail "
+                    f"shortly — this page does not need to stay open.",
+                )
+                return redirect("crm:schedule_list")
+
+    return render(request, "crm/send.html", _base(
+        request,
+        campaigns=campaigns,
+        campaign=campaign,
+        queue=queue[:500],
+        queue_total=queue.count() if campaign else 0,
+        preflight=preflight,
+        gmail_connected=gmail_svc.has_usable_credential(request.member),
+    ))

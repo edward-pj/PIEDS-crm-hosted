@@ -1,0 +1,107 @@
+{% extends "crm/base.html" %}
+
+{% block title %}Gmail — Ignite CRM{% endblock %}
+{% block heading %}Gmail{% endblock %}
+
+{% block content %}
+
+<div class="card" style="max-width:44rem">
+  <header>
+    <h2>Send mail as {{ member.bits_email }}</h2>
+    <p class="muted text-sm">
+      The CRM sends from your own mailbox, so replies land in your inbox and your
+      mail is not delivered as a bulk sender. It needs your permission once.
+    </p>
+  </header>
+
+  <section class="col" style="gap:1.25rem">
+
+    {% if not google_configured or not key_configured %}
+      <div class="alert alert-destructive">
+        <section>
+          <p><strong>Not available on this deployment.</strong></p>
+          <p class="text-sm">
+            {% if not google_configured %}
+              <code>GOOGLE_OAUTH_CLIENT_ID</code> / <code>GOOGLE_OAUTH_CLIENT_SECRET</code>
+              are not set.
+            {% endif %}
+            {% if not key_configured %}
+              <code>GMAIL_TOKEN_KEY</code> is not set, so a grant could not be
+              stored securely.
+            {% endif %}
+            Ask a lead to configure it before connecting.
+          </p>
+        </section>
+      </div>
+
+    {% elif connected %}
+      <div class="alert">
+        <section>
+          <p><strong>Connected</strong> as {{ credential.google_email }}.</p>
+          <p class="text-sm muted">
+            Granted {{ credential.granted_at }}.
+            {% if credential.last_refreshed_at %}
+              Last refreshed {{ credential.last_refreshed_at }}.
+            {% endif %}
+          </p>
+        </section>
+      </div>
+
+      {% comment %}
+        Shown even when everything is fine. A member who has forgotten they
+        granted mailbox access is exactly the person who should be reminded
+        that they can take it away without asking anyone.
+      {% endcomment %}
+      <p class="text-sm muted">
+        You can revoke this at any time from
+        <a href="https://myaccount.google.com/permissions" target="_blank" rel="noopener">
+          your Google account</a>, with or without using the button below. If you
+        do, the CRM will say Gmail is disconnected rather than failing quietly.
+      </p>
+
+      <form method="post" action="{% url 'crm:gmail_disconnect' %}">
+        {% csrf_token %}
+        <button type="submit" class="btn btn-outline">Disconnect Gmail</button>
+      </form>
+
+    {% else %}
+      {% if credential and credential.last_error %}
+        <div class="alert alert-destructive">
+          <section>
+            <p><strong>Gmail access stopped working.</strong></p>
+            <p class="text-sm">{{ credential.last_error }}</p>
+            <p class="text-sm muted">Reconnect below to start sending again.</p>
+          </section>
+        </div>
+      {% endif %}
+
+      <div class="col" style="gap:.5rem">
+        <span class="label">What you are granting</span>
+        <ul class="text-sm muted" style="margin:0;padding-left:1.1rem">
+          <li><strong>Send mail on your behalf</strong> — the campaigns assigned to you.</li>
+          <li><strong>Read your mail</strong> — used only to notice when a prospect
+            replies, so follow-ups stop, and to check whether an interrupted send
+            actually went out.</li>
+        </ul>
+        <p class="text-sm muted">
+          Nothing is sent without an action from you or a send you scheduled. The
+          CRM never reads mail unrelated to a thread it started.
+        </p>
+      </div>
+
+      <form method="post" action="{% url 'crm:gmail_connect' %}">
+        {% csrf_token %}
+        <button type="submit" class="btn">Connect Gmail</button>
+      </form>
+
+      <p class="text-sm muted">
+        Sign in to Google as <strong>{{ member.bits_email }}</strong>. Granting
+        access from any other account is refused — mail has to come from the
+        person the CRM records as having sent it.
+      </p>
+    {% endif %}
+
+  </section>
+</div>
+
+{% endblock %}

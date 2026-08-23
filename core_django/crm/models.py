@@ -86,6 +86,104 @@ class TeamMember(TimeStampedModel):
         """What a recipient sees in the From line."""
         return self.sender_name or self.name
 
+    @property
+    def gmail_connected(self) -> bool:
+        """Whether this member has a live Gmail grant.
+
+        A reverse OneToOne raises rather than returning None when absent, and
+        "has never connected" is the common case, so the exception is the normal
+        path here -- not an error worth logging.
+        """
+        try:
+            return self.gmail_credential.is_usable
+        except GmailCredential.DoesNotExist:
+            return False
+
+
+class GmailCredential(TimeStampedModel):
+    """A member's authorisation for this server to send mail as them.
+
+    This is the single biggest change to the security model in the codebase.
+    Previously the CRM deliberately held no Gmail credentials -- the sending
+    agent ran on the member's own laptop, and the server therefore *could not*
+    impersonate anyone even if it were compromised. Hosting gives that up: a
+    member logs in, sends, and closes the tab, so something awake must hold
+    their authorisation.
+
+    What replaces the old guarantee:
+
+    - The refresh token is encrypted at rest (see services/secrets.py), so a
+      database dump on its own yields nothing usable.
+    - `google_email` records which Google account actually granted this, checked
+      against the member's `bits_email` at grant time and re-verified against
+      Gmail's own `getProfile` before the first send after any credential
+      change. `CampaignMailing.sent_by` is only honest because of that check.
+    - A member can revoke this from their own Google account page at any time,
+      with no cooperation from us. When they do, the refresh fails, `last_error`
+      is recorded, and the CRM says "Gmail not connected" instead of silently
+      dropping their mail on the floor.
+
+    One row per member: a second Gmail account for the same person would make
+    `sent_by` ambiguous, which is the one thing that must never happen.
+    """
+
+    member = models.OneToOneField(
+        TeamMember, on_delete=models.CASCADE, related_name="gmail_credential"
+    )
+
+    #: The account Google says granted this. NOT assumed equal to bits_email --
+    #: it is compared with it, and a mismatch refuses the grant.
+    google_email = models.EmailField()
+
+    #: Fernet ciphertext. Never log, never render, never put in an API response.
+    refresh_token_encrypted = models.BinaryField()
+    key_version = models.PositiveSmallIntegerField(
+        help_text="Which GMAIL_TOKEN_KEY version encrypted this row."
+    )
+
+    #: Cached so a send does not pay a round trip to Google per message.
+    #: `Credentials(token=None)` is never `valid`, so without this every single
+    #: mail refreshes first -- which inside a bounded request budget is felt
+    #: immediately. Encrypted too: it is a live credential for its lifetime.
+    access_token_encrypted = models.BinaryField(null=True, blank=True)
+    access_token_key_version = models.PositiveSmallIntegerField(null=True, blank=True)
+    access_token_expires_at = models.DateTimeField(null=True, blank=True)
+
+    #: What Google actually granted, which is not always what we asked for --
+    #: a member can untick a scope on the consent screen. Checked before a send
+    #: rather than discovered as a 403 halfway through a batch.
+    granted_scopes = models.JSONField(default=list, blank=True)
+
+    granted_at = models.DateTimeField(default=timezone.now)
+    last_refreshed_at = models.DateTimeField(null=True, blank=True)
+
+    #: When `getProfile` last confirmed the token really belongs to
+    #: `google_email`. Cleared whenever the credential changes.
+    identity_verified_at = models.DateTimeField(null=True, blank=True)
+
+    #: The last refusal from Google, kept so the member is told *why* they need
+    #: to reconnect. An empty string means the credential is believed good.
+    last_error = models.TextField(blank=True)
+
+    #: Set when the member disconnects, or when a refresh proves the grant is
+    #: dead. The row is kept rather than deleted: "connected once, then revoked"
+    #: and "never connected" are different facts when mail stops going out.
+    revoked_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "gmail_credentials"
+
+    def __str__(self):
+        state = "revoked" if self.revoked_at else "active"
+        return f"{self.google_email} ({state})"
+
+    @property
+    def is_usable(self) -> bool:
+        return self.revoked_at is None and bool(self.refresh_token_encrypted)
+
+    def has_scopes(self, required) -> bool:
+        return set(required).issubset(set(self.granted_scopes or []))
+
 
 class ApiToken(TimeStampedModel):
     """Bearer token letting a member's local agent talk to this server.

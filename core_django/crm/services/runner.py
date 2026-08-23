@@ -1,0 +1,218 @@
+"""Executing queued sends, server-side.
+
+This is `local_agent/services/schedule_runner.py` with the polling loop removed.
+The laptop version woke itself every 60 seconds; a hosted free instance cannot,
+because it is asleep between requests and only a request can wake it. So the
+work happens *inside* a request instead, and something external decides how
+often that request arrives.
+
+That is less of a change than it sounds. `api/views.py::schedule_claim` already
+ran the housekeeping on the polling path, with the comment "the housekeeping
+runs as often as the thing it cleans up, with no extra process to keep alive".
+Hosting only changes who polls.
+
+**Phase 1 ships the executor; the door and the lock arrive with the scheduler
+phase.** Today `tick()` is reached only by `manage.py run_tick`, which is enough
+to drain the queue on a machine someone is looking at. What it deliberately does
+NOT yet do -- and must, before this runs on a platform with several workers --
+is take the advisory lock that stops two overlapping ticks, sweep expired leases
+and missed jobs, and run the follow-up rules. Until then, run one tick at a time.
+
+An in-process background thread was considered and rejected: `AppConfig.ready()`
+runs in every gunicorn worker (so three workers means three schedulers racing),
+and also under `migrate`, `collectstatic`, `shell` and pytest -- a live scheduler
+inside the test suite, avoidable only by sniffing `sys.argv`. It would hold a
+pooler connection permanently against a deliberate `CONN_MAX_AGE=0`. And it does
+not even solve the problem: the instance sleeps and takes the thread with it, so
+the thread only runs when something is already keeping the service awake.
+"""
+
+import logging
+import socket
+from dataclasses import dataclass, field
+from datetime import timedelta
+
+from django.utils import timezone
+
+from crm.models import GmailCredential, TeamMember
+
+from . import scheduling as schedule_svc
+from .gmail import GmailAuthError, GmailClient
+from .sending import SENT, send_batch
+
+log = logging.getLogger(__name__)
+
+#: Jobs leased per member per tick.
+CLAIM_LIMIT = 5
+
+#: A tick executes inside an HTTP request, so it must finish well inside any
+#: proxy timeout and must not monopolise a worker. Both are ceilings, not
+#: targets: a tick that runs out of budget simply stops, and the next one
+#: continues from the cursor.
+TICK_MAX_MAILS = 40
+TICK_MAX_SECONDS = 45
+
+
+@dataclass
+class TickReport:
+    """What one tick did. Returned as JSON so a failing pinger means something."""
+
+    started_at: str = ""
+    members: int = 0
+    jobs: int = 0
+    sent: int = 0
+    skipped: int = 0
+    errors: list = field(default_factory=list)
+    stopped_early: bool = False
+
+    def dict(self):
+        return {
+            "started_at": self.started_at,
+            "members": self.members,
+            "jobs": self.jobs,
+            "sent": self.sent,
+            "skipped": self.skipped,
+            "errors": self.errors[:10],
+            "stopped_early": self.stopped_early,
+        }
+
+
+def executor_id() -> str:
+    """Who holds the lease. Only ever read by a human reading the CRM."""
+    return f"server:{socket.gethostname()}"
+
+
+def sendable_members():
+    """Members the server can actually send as.
+
+    Anyone without a live Gmail grant is skipped rather than leased and failed:
+    leasing a job we cannot execute burns the attempts counter and fills
+    `last_error` with the same sentence every tick, which buries the real
+    failures under noise.
+    """
+    member_ids = (
+        GmailCredential.objects
+        .filter(revoked_at__isnull=True)
+        .values_list("member_id", flat=True)
+    )
+    return TeamMember.objects.filter(id__in=list(member_ids), is_active=True)
+
+
+def run_job(member, job, *, gmail, budget, deadline) -> dict:
+    """Send one claimed job's slice. Returns what to report back.
+
+    Counts `attempted`, not just sent: the cursor advances by that, and a
+    contact permanently skipped (unassigned, archived, do_not_contact) must move
+    it too, or the job never finishes.
+    """
+    contact_ids = job.next_slice(job.batch_size or None)
+    if not contact_ids:
+        return {"attempted": 0, "sent": 0, "skipped": 0, "error": ""}
+
+    sent = skipped = 0
+    resolved = 0
+    errors: list[str] = []
+
+    for outcome in send_batch(
+        member, job.campaign, contact_ids,
+        cc=job.cc, bcc=job.bcc,
+        gmail=gmail, max_mails=budget, deadline=deadline,
+    ):
+        resolved += 1
+        if outcome.status == SENT:
+            sent += 1
+        else:
+            skipped += 1
+            if outcome.detail:
+                errors.append(f"{outcome.email}: {outcome.detail}")
+
+    return {
+        # `resolved`, not `len(contact_ids)`: a bounded run may stop partway
+        # through the slice, and advancing the cursor past contacts nobody
+        # attempted would silently drop them from the job forever.
+        "attempted": resolved,
+        "sent": sent,
+        "skipped": skipped,
+        # Only a sample: a batch of 200 bad addresses should not post 200 lines
+        # of prose into a text column someone has to read.
+        "error": "; ".join(errors[:5])[:2000],
+    }
+
+
+def run_for_member(member, report, *, deadline, gmail=None) -> None:
+    """Drain what this member has due, within the tick's budget."""
+    try:
+        client = GmailClient(member) if gmail is None else gmail
+        # Proves the token really belongs to this member before anything is
+        # leased. Cached on the row, so this is free after the first call.
+        client.verify_identity()
+    except GmailAuthError as exc:
+        # Not an error worth shouting about every tick: the member has to
+        # reconnect, and the CRM already tells them so on their own page.
+        log.info("skipping %s: %s", member.bits_email, exc)
+        return
+
+    jobs = schedule_svc.claim_due(member, agent_id=executor_id(), limit=CLAIM_LIMIT)
+    for job in jobs:
+        report.jobs += 1
+        remaining = TICK_MAX_MAILS - report.sent
+
+        try:
+            result = run_job(
+                member, job, gmail=client, budget=max(0, remaining), deadline=deadline
+            )
+        except Exception as exc:                                # noqa: BLE001
+            # A job-level failure: the credential died mid-batch, the database
+            # went away. Individual bad mails never reach here -- send_batch
+            # isolates those and reports them per contact.
+            log.exception("scheduled send %s failed", job.id)
+            detail = f"{type(exc).__name__}: {exc}"
+            report.errors.append(f"job {job.id}: {detail}")
+            schedule_svc.mark_failed(job.id, member, detail)
+            continue
+
+        report.sent += result["sent"]
+        report.skipped += result["skipped"]
+        if result["error"]:
+            report.errors.append(f"job {job.id}: {result['error']}")
+
+        schedule_svc.record_progress(
+            job.id, member,
+            attempted=result["attempted"], sent=result["sent"],
+            skipped=result["skipped"], error=result["error"],
+        )
+
+        if timezone.now() >= deadline or report.sent >= TICK_MAX_MAILS:
+            report.stopped_early = True
+            return
+
+
+def tick(*, now=None, max_seconds=TICK_MAX_SECONDS, gmail_for=None) -> TickReport:
+    """One pass over everything that is due.
+
+    Every failure mode is per-member and per-job: one broken credential must not
+    stop the others, and must not stop the next tick either.
+
+    `gmail_for` is a hook for tests -- a callable taking a member and returning
+    a client. Production passes nothing.
+    """
+    now = now or timezone.now()
+    deadline = now + timedelta(seconds=max_seconds)
+    report = TickReport(started_at=now.isoformat())
+
+    for member in sendable_members():
+        if timezone.now() >= deadline or report.sent >= TICK_MAX_MAILS:
+            report.stopped_early = True
+            break
+
+        report.members += 1
+        try:
+            run_for_member(
+                member, report, deadline=deadline,
+                gmail=gmail_for(member) if gmail_for else None,
+            )
+        except Exception as exc:                                # noqa: BLE001
+            log.exception("tick failed for %s", member.bits_email)
+            report.errors.append(f"{member.bits_email}: {type(exc).__name__}: {exc}")
+
+    return report

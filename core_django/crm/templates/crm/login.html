@@ -27,46 +27,36 @@
         <div class="alert alert-destructive"><section><p>{{ message }}</p></section></div>
       {% endfor %}
 
-      {# ---- batch 2025: Google, because the agent proves the same identity ---- #}
+      {% comment %}
+        One door for everybody. The name-picker that used to sit below this was
+        removed when the CRM got a public hostname -- see crm/services/auth.py.
+        Do not add a password field here either; the whole point is that
+        identity is proved to Google, not to us.
+
+        Written as a comment tag, not a hash comment: Django's hash comments are
+        single-line, so a multi-line one renders straight onto the page.
+      {% endcomment %}
       <div class="col" style="gap:.5rem">
-        <span class="label">Batch 2025</span>
         {% if google_enabled %}
           <a class="btn" href="{% url 'google_login' %}" style="width:100%;justify-content:center">
             Sign in with your BITS Google account
           </a>
+          {% if hosted_domain %}
+            <p class="muted text-sm">
+              Use your <code>@{{ hosted_domain }}</code> account. Personal Gmail
+              will be refused.
+            </p>
+          {% endif %}
         {% else %}
           <button class="btn" style="width:100%;justify-content:center" disabled>
             Sign in with Google
           </button>
           <p class="muted text-sm">
-            Not configured on this machine — set <code>GOOGLE_OAUTH_CLIENT_ID</code>
-            and <code>GOOGLE_OAUTH_CLIENT_SECRET</code> in <code>.env</code>.
+            Not configured on this deployment — set <code>GOOGLE_OAUTH_CLIENT_ID</code>
+            and <code>GOOGLE_OAUTH_CLIENT_SECRET</code>.
           </p>
         {% endif %}
       </div>
-
-      <hr>
-
-      {# ---- batch 2024: name only. Only reachable on your own machine. ---- #}
-      <form method="post" action="{% url 'login_by_name' %}" class="col" style="gap:.5rem">
-        {% csrf_token %}
-        <span class="label">Batch {{ lead_batch }} — leads</span>
-        {% if leads %}
-          <select class="select" name="member_id" aria-label="Your name" required>
-            {% for lead in leads %}
-              <option value="{{ lead.id }}">{{ lead.name }}</option>
-            {% endfor %}
-          </select>
-          <button type="submit" class="btn btn-outline" style="width:100%;justify-content:center">
-            Continue
-          </button>
-        {% else %}
-          <p class="muted text-sm">
-            No active batch-{{ lead_batch }} members yet. Add one in
-            <a href="/admin/">the admin</a> or run <code>manage.py seed_dev</code>.
-          </p>
-        {% endif %}
-      </form>
 
     </section>
   </div>

@@ -150,24 +150,29 @@ There is no password anywhere in the CRM. `services/auth.py` holds both doors,
 and identity is a session key holding a `TeamMember` id — Django's `User` model
 is consulted only by `/admin/`.
 
-**Batch 2024 picks their name from a list.** Every lead runs the CRM on their own
-laptop against the shared database, so the only person who can reach that form is
-the person holding the machine. A password there protects nothing the laptop's
-lock screen doesn't.
+**Everyone signs in with Google**, restricted to the BITS hosted domain and
+matched against `TeamMember.bits_email`. The check is on Google's signed
+`id_token` and its `hd` claim, not on the address string, so a personal Gmail
+cannot present itself as a BITS one. Members must prove that identity anyway in
+order to send, so this reuses a proof they already have to give rather than
+inventing a second one.
 
-**Batch 2025 signs in with Google**, restricted to the BITS hosted domain and
-matched against `TeamMember.bits_email`. They must prove that identity anyway —
-the sending agent refuses to run unless the Gmail session matches the member — so
-this reuses a proof they already have to give rather than inventing a second one.
+**There used to be a second door, and it is gone.** Batch 2024 picked a name
+from a dropdown with no password, justified on the grounds that every lead ran
+the CRM on their own laptop, so the only person who could reach the form was the
+person holding the machine. That was true then and is simply false now: on a
+public hostname the form is reachable by anyone, and the leads' UUIDs — the only
+credential it asked for — were rendered into the page as `<option value>`.
 
-**The 2025 half is a refusal, not a filter.** The name list only contains leads,
-but posting a 2025 member's id directly to `/login/name/` is rejected too. If
-anyone could claim a lead identity from a dropdown, every rule in the table above
-would be advisory. That is what `test_login.py` pins.
+It was deleted rather than hidden behind a setting, because a setting leaves the
+code one misconfigured environment variable away from an unauthenticated login
+as any lead. `test_login.py::TestTheNameDoorIsGone` is the tripwire: it asserts
+the route does not resolve, that `POST /login/name/` is a 404, and that no member
+UUID appears anywhere in the login page. If any of those fail, the hole is back.
 
-> **This assumes the CRM is reachable only by people you trust** — on localhost,
-> or on a network only the team can reach. Do not put the name door on a public
-> hostname: it is, deliberately, a list of names and a Continue button.
+**Adding a new person** is a lead's job through `/admin/` until join codes land.
+There is no self-service door and no fallback if Google is misconfigured — the
+login page says so rather than degrading to something weaker.
 
 **Why 2025 members can edit at all.** They are the ones actually in conversation
 with their prospects, so they are the first to learn that a designation changed
@@ -735,8 +740,8 @@ only; nothing inside the stack notices.
 git clone <repo> && cd ignite_crm
 
 python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-cp .env.example .env               # then edit it
+.venv/bin/pip install -r requirements-dev.txt   # runtime deps + pytest
+cp .env.example .env               # then edit it — the suite needs DJANGO_DEBUG=True
 
 docker compose up -d               # Postgres 16 on :5432
 
@@ -1160,7 +1165,8 @@ ignite_crm/
 │   ├── entrypoint-crm.sh          wait → migrate → check_db → seed → serve
 │   └── entrypoint-agent.sh        fail fast on a missing token
 ├── pytest.ini
-├── requirements.txt
+├── requirements.txt          runtime only — what the image installs
+├── requirements-dev.txt      the above plus pytest
 ├── .env.example
 │
 ├── shared/                        imported by BOTH apps
@@ -1383,9 +1389,10 @@ autoresponder — but it is not sentiment analysis.
 **Dev credentials are in the repo.** `docker-compose.yml` uses `ignite:ignite`.
 Harmless on localhost, but visible in a public org repo.
 
-**The name door trusts the network.** Batch-2024 sign-in is a dropdown and a
-button (§4.1). That is a deliberate trade for a tool every lead runs on their own
-laptop, and it is wrong the moment the CRM gets a public hostname.
+**~~The name door trusts the network.~~** *Closed.* Batch-2024 sign-in was a
+dropdown and a button, a deliberate trade for a tool every lead ran on their own
+laptop. The route, the view, the service functions and the form are all deleted;
+see §4.1.
 
 **`bounced` is never set automatically.** Nothing reads bounce notifications;
 a lead sets it by hand. Inferring it from SMTP error strings was judged worse

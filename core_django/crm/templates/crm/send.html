@@ -1,0 +1,151 @@
+{% extends "crm/base.html" %}
+
+{% block title %}Send — Ignite CRM{% endblock %}
+{% block heading %}Send{% endblock %}
+
+{% block content %}
+
+{% if not gmail_connected %}
+  <div class="alert alert-destructive mb-2">
+    <section>
+      <p><strong>Gmail is not connected.</strong></p>
+      <p class="text-sm">
+        The CRM sends from your own mailbox, so it needs your permission once.
+        <a href="{% url 'crm:gmail_settings' %}">Connect Gmail</a>.
+      </p>
+    </section>
+  </div>
+{% endif %}
+
+<form method="get" class="row mb-2" style="gap:.5rem;align-items:end">
+  <div class="col" style="gap:.25rem">
+    <label class="label" for="campaign">Campaign</label>
+    <select class="select" name="campaign" id="campaign" onchange="this.form.submit()">
+      <option value="">Choose a campaign…</option>
+      {% for c in campaigns %}
+        <option value="{{ c.id }}" {% if campaign and c.id == campaign.id %}selected{% endif %}>
+          {{ c.title }}
+        </option>
+      {% endfor %}
+    </select>
+  </div>
+  <noscript><button type="submit" class="btn btn-outline">Load</button></noscript>
+</form>
+
+{% if not campaigns %}
+  <div class="card"><section>
+    <p class="muted">
+      No active campaigns. A campaign has to be <strong>active</strong> before
+      anything can be mailed from it — that is the emergency brake, not an
+      oversight.
+    </p>
+  </section></div>
+
+{% elif campaign %}
+
+  {% if preflight %}
+    <div class="card mb-2">
+      <header>
+        <h2>Dry run</h2>
+        <p class="muted text-sm">Nothing was sent and nothing was written.</p>
+      </header>
+      <section>
+        <table class="table">
+          <thead><tr><th>Contact</th><th>Email</th><th>Result</th><th>Detail</th></tr></thead>
+          <tbody>
+            {% for row in preflight %}
+              <tr>
+                <td>{{ row.name }}</td>
+                <td class="muted text-sm">{{ row.email }}</td>
+                <td>
+                  <span class="badge{% if row.status != 'OK' %} badge-secondary{% endif %}">
+                    {{ row.status }}
+                  </span>
+                </td>
+                <td class="muted text-sm">{{ row.detail }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </section>
+    </div>
+  {% endif %}
+
+  <form method="post">
+    {% csrf_token %}
+    <input type="hidden" name="campaign" value="{{ campaign.id }}">
+
+    <div class="card">
+      <header>
+        <h2>{{ campaign.title }}</h2>
+        <p class="muted text-sm">
+          {{ queue_total }} contact(s) assigned to you and not yet mailed for this
+          campaign.
+          {% if queue_total > 500 %}Showing the first 500.{% endif %}
+        </p>
+      </header>
+
+      <section class="col" style="gap:1rem">
+
+        {% if not queue %}
+          <p class="muted">
+            Nothing to send. Either everything assigned to you has already been
+            mailed for this campaign, or nothing is assigned to you yet — ask a
+            lead to assign you some contacts.
+          </p>
+        {% else %}
+
+          <div class="row" style="gap:.5rem">
+            <button type="submit" name="action" value="preflight" class="btn btn-outline">
+              Dry run
+            </button>
+            <button type="submit" name="action" value="send" class="btn"
+                    {% if not gmail_connected %}disabled{% endif %}>
+              Send selected
+            </button>
+          </div>
+
+          <details>
+            <summary class="text-sm muted">Copy addresses (CC / BCC)</summary>
+            <div class="row mt-1" style="gap:.5rem">
+              <input class="input" type="text" name="cc" placeholder="cc, comma separated">
+              <input class="input" type="text" name="bcc" placeholder="bcc, comma separated">
+            </div>
+            <p class="text-sm muted mt-1">
+              These apply to <strong>every</strong> mail in the batch, so ten
+              addresses on a 200-mail send is two thousand extra deliveries.
+            </p>
+          </details>
+
+          <table class="table">
+            <thead>
+              <tr>
+                <th style="width:2.5rem">
+                  <input type="checkbox" aria-label="Select all"
+                         onclick="for (const b of this.closest('table').querySelectorAll('input[name=contact_ids]')) b.checked = this.checked">
+                </th>
+                <th>Contact</th>
+                <th>Company</th>
+                <th>Email</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for c in queue %}
+                <tr>
+                  <td><input type="checkbox" name="contact_ids" value="{{ c.id }}" checked></td>
+                  <td>{{ c.full_name }}</td>
+                  <td class="muted text-sm">{{ c.company }}</td>
+                  <td class="muted text-sm">{{ c.email }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        {% endif %}
+
+      </section>
+    </div>
+  </form>
+
+{% endif %}
+
+{% endblock %}

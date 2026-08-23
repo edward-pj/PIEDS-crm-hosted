@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 
 import environ
+from django.core.exceptions import ImproperlyConfigured
 
 BASE_DIR = Path(__file__).resolve().parent.parent      # core_django/
 REPO_ROOT = BASE_DIR.parent                            # ignite_crm/
@@ -15,9 +16,34 @@ env = environ.Env(
 )
 environ.Env.read_env(REPO_ROOT / ".env")
 
-SECRET_KEY = env("DJANGO_SECRET_KEY", default="dev-insecure-key-do-not-use-in-prod")
+#: Django's test runner CREATEs and DROPs its database. Once DATABASE_URL points
+#: at Supabase -- as it will in everyone's .env -- an ordinary `pytest` would aim
+#: that at the hosted instance. Tests therefore always run against local Docker
+#: Postgres, regardless of the environment. Override with IGNITE_TEST_DATABASE_URL.
+#:
+#: Read here rather than beside the database block because the production guards
+#: below must not fire under pytest, which runs with DJANGO_DEBUG unset and so
+#: sees DEBUG=False.
+RUNNING_TESTS = "pytest" in sys.modules or "test" in sys.argv
+
+#: Named so the guard below can recognise it. Never use this value anywhere.
+INSECURE_DEV_SECRET_KEY = "dev-insecure-key-do-not-use-in-prod"
+
+SECRET_KEY = env("DJANGO_SECRET_KEY", default=INSECURE_DEV_SECRET_KEY)
 DEBUG = env("DJANGO_DEBUG")
 ALLOWED_HOSTS = env("DJANGO_ALLOWED_HOSTS")
+
+# Hosting turns each of the convenient dev fallbacks into a live vulnerability,
+# so in production they fail the boot instead of applying quietly. A container
+# running on the shipped key signs session cookies that anyone holding a copy of
+# this repository can forge -- and a crash at startup is a deploy that visibly
+# failed, where the fallback is a deploy that looks fine and is not.
+if not DEBUG and not RUNNING_TESTS and SECRET_KEY == INSECURE_DEV_SECRET_KEY:
+    raise ImproperlyConfigured(
+        "DJANGO_SECRET_KEY is still the shipped development key, and DEBUG is "
+        "off. Set a real one:  python -c 'import secrets; "
+        "print(secrets.token_urlsafe(64))'"
+    )
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -71,16 +97,21 @@ WSGI_APPLICATION = "config.wsgi.application"
 
 LOCAL_DATABASE_URL = "postgres://ignite:ignite@localhost:5432/ignite_crm"
 
-#: Django's test runner CREATEs and DROPs its database. Once DATABASE_URL points
-#: at Supabase -- as it will in everyone's .env -- an ordinary `pytest` would aim
-#: that at the hosted instance. Tests therefore always run against local Docker
-#: Postgres, regardless of the environment. Override with IGNITE_TEST_DATABASE_URL.
-RUNNING_TESTS = "pytest" in sys.modules or "test" in sys.argv
-
 if RUNNING_TESTS:
     DATABASE_URL = env("IGNITE_TEST_DATABASE_URL", default=LOCAL_DATABASE_URL)
 else:
-    DATABASE_URL = env("DATABASE_URL", default=LOCAL_DATABASE_URL)
+    DATABASE_URL = env("DATABASE_URL", default=None)
+    if DATABASE_URL is None:
+        # Falling back to localhost in a hosted container is the worst kind of
+        # failure: the process boots, serves, and quietly talks to a database
+        # that does not exist -- or, on a shared host, to the wrong one.
+        if not DEBUG:
+            raise ImproperlyConfigured(
+                "DATABASE_URL is not set and DEBUG is off. Point it at the "
+                "Supabase SESSION pooler (port 5432, not 6543) with "
+                "?sslmode=require."
+            )
+        DATABASE_URL = LOCAL_DATABASE_URL
 
 DATABASES = {"default": env.db_url_config(DATABASE_URL)}
 
@@ -114,6 +145,37 @@ STATICFILES_DIRS = [REPO_ROOT / "shared" / "static"]
 STATIC_ROOT = BASE_DIR / "staticfiles"
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+#: CSV import parses the whole upload and stashes every importable row in the
+#: SESSION (crm/views.py::contact_import), and sessions are database-backed --
+#: so an oversized import is written through the Supabase pooler row by row
+#: before anyone has confirmed it. Django's own default is 2.5 MB; it is set
+#: explicitly here because on a public host this is a deliberate ceiling rather
+#: than an incidental one. A 2.5 MB CSV is roughly 20,000 contacts.
+DATA_UPLOAD_MAX_MEMORY_SIZE = env.int("DATA_UPLOAD_MAX_MEMORY_SIZE", default=2621440)
+
+#: Render captures stdout and nothing else; without this there is no application
+#: logging at all in production, and a swallowed exception leaves no trace.
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "simple": {"format": "{levelname} {asctime} {name} {message}", "style": "{"},
+    },
+    "handlers": {
+        "stdout": {
+            "class": "logging.StreamHandler",
+            "stream": sys.stdout,
+            "formatter": "simple",
+        },
+    },
+    "root": {"handlers": ["stdout"], "level": env("DJANGO_LOG_LEVEL", default="INFO")},
+    "loggers": {
+        # Unhandled exceptions in a view. Django logs these at ERROR and would
+        # otherwise only mail them to ADMINS, which is configured nowhere.
+        "django.request": {"handlers": ["stdout"], "level": "ERROR", "propagate": False},
+    },
+}
 
 LOGIN_URL = "/login/"
 LOGIN_REDIRECT_URL = "/"
@@ -156,10 +218,46 @@ GOOGLE_OAUTH_HOSTED_DOMAIN = env(
     "GOOGLE_OAUTH_HOSTED_DOMAIN", default="pilani.bits-pilani.ac.in"
 )
 
+# --- sending mail --------------------------------------------------------
+# The server sends on each member's behalf using a Gmail refresh token they
+# granted in the browser. That token is encrypted at rest with this key; see
+# crm/services/secrets.py for exactly what that does and does not protect.
+#
+# Generate one:
+#   python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
+#
+# LOSING THIS KEY means every stored token becomes unreadable and every member
+# has to reconnect Gmail. It belongs in the hosting platform's environment and
+# nowhere near the database, which is the whole point of encrypting with it.
+GMAIL_TOKEN_KEY = env("GMAIL_TOKEN_KEY", default="")
+
+#: Seconds of slack when deciding whether a cached access token is still usable.
+#: A token that expires mid-flight fails the send it was fetched for.
+GMAIL_TOKEN_EXPIRY_SKEW_SECONDS = env.int("GMAIL_TOKEN_EXPIRY_SKEW_SECONDS", default=120)
+
+#: Pause between messages within one send run. Gmail's per-account quota is
+#: real and tripping it throttles the mailbox for hours.
+GMAIL_SEND_DELAY_SECONDS = env.float("GMAIL_SEND_DELAY_SECONDS", default=0.0)
+
 # --- production hardening -------------------------------------------------
-# Agents authenticate with a bearer token over the public internet, so TLS is
-# not optional once DEBUG is off.
-if not DEBUG:
+# The CRM is reachable from the public internet, so TLS is not optional once
+# DEBUG is off.
+
+# Set unconditionally: a cookie that a cross-site request can carry is a CSRF
+# hole in development too, and "Lax" still allows the top-level GET redirect
+# that Google's OAuth callback arrives as.
+SESSION_COOKIE_SAMESITE = "Lax"
+CSRF_COOKIE_SAMESITE = "Lax"
+SECURE_REFERRER_POLICY = "strict-origin-when-cross-origin"
+
+# `not RUNNING_TESTS` is load-bearing, not defensive. Without it the whole block
+# applies under pytest -- there is no .env in a fresh checkout, so DEBUG is
+# False -- and SECURE_SSL_REDIRECT turns every self.client.get() into a 301
+# before it reaches a view. The suite then silently tests TLS redirects instead
+# of the CRM, and its result depends on whether an untracked file exists.
+# The production block is exercised by setting its settings explicitly in the
+# tests that care (see tests/test_login.py::TestHealthz).
+if not DEBUG and not RUNNING_TESTS:
     STORAGES = {
         "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
         "staticfiles": {
@@ -167,12 +265,36 @@ if not DEBUG:
         },
     }
     SECURE_SSL_REDIRECT = True
+
+    # The platform health check reaches the container on its own port over plain
+    # HTTP, with no X-Forwarded-Proto header. Without this exemption /healthz
+    # answers 301 rather than 200 and every deploy is marked unhealthy -- which
+    # presents as a broken application rather than as a misconfigured redirect.
+    # Matched against request.path with the leading slash stripped.
+    SECURE_REDIRECT_EXEMPT = [r"^healthz$"]
+
     SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
     SECURE_HSTS_SECONDS = 31536000
     SECURE_HSTS_INCLUDE_SUBDOMAINS = True
     X_FRAME_OPTIONS = "DENY"
-    CSRF_TRUSTED_ORIGINS = [
-        f"https://{host}" for host in ALLOWED_HOSTS if host not in ("*",)
+
+    # Explicit first, derived second.
+    #
+    # The derivation has to translate, not concatenate: the two settings spell a
+    # subdomain wildcard differently. ALLOWED_HOSTS uses a leading dot
+    # (".onrender.com"); CSRF_TRUSTED_ORIGINS wants an explicit star
+    # ("https://*.onrender.com"). Pasting a scheme onto the former yields
+    # "https://.onrender.com", which matches no host at all -- and that failure
+    # surfaces as a 403 on form submission from the very subdomain you deployed
+    # to, long after the deploy looked successful.
+    #
+    # ALLOWED_HOSTS=["*"] derives to an empty list, which is why the explicit
+    # environment variable exists and why it is consulted first.
+    def _as_csrf_origin(host):
+        return f"https://*{host}" if host.startswith(".") else f"https://{host}"
+
+    CSRF_TRUSTED_ORIGINS = env.list("DJANGO_CSRF_TRUSTED_ORIGINS", default=[]) or [
+        _as_csrf_origin(host) for host in ALLOWED_HOSTS if host != "*"
     ]

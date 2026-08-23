@@ -69,6 +69,29 @@ class Command(BaseCommand):
             except Exception as exc:                       # noqa: BLE001
                 failures.append(f"SELECT ... FOR UPDATE failed: {exc}")
 
+        # The server now holds Gmail refresh tokens, so a missing or broken
+        # encryption key is a boot-time failure like any other. Without this
+        # check, check_db passes cleanly and then every single send fails on a
+        # key that was never set -- which reads as "Gmail is broken", not as
+        # "an environment variable is missing".
+        try:
+            from crm.services import secrets as token_store
+
+            if not token_store.is_configured():
+                failures.append(
+                    "GMAIL_TOKEN_KEY is not set. Refresh tokens cannot be stored "
+                    "or read, so nobody can send. Generate one:  python -c "
+                    "'from cryptography.fernet import Fernet; "
+                    "print(Fernet.generate_key().decode())'"
+                )
+            else:
+                token_store.self_test()
+                self.stdout.write(
+                    self.style.SUCCESS("  ok     GMAIL_TOKEN_KEY round-trips")
+                )
+        except Exception as exc:                           # noqa: BLE001
+            failures.append(f"GMAIL_TOKEN_KEY is unusable: {exc}")
+
         if failures:
             raise CommandError(
                 "Database is not safe to send from:\n  - " + "\n  - ".join(failures)

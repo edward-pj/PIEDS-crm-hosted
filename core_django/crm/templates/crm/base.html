@@ -24,6 +24,7 @@
 
     <a href="{% url 'crm:home' %}" {% if request.resolver_match.url_name == 'home' %}aria-current="page"{% endif %}>Dashboard</a>
     <a href="{% url 'crm:contact_list' %}" {% if 'contact' in request.resolver_match.url_name %}aria-current="page"{% endif %}>Contacts</a>
+    <a href="{% url 'crm:send' %}" {% if request.resolver_match.url_name == 'send' %}aria-current="page"{% endif %}>Send</a>
     <a href="{% url 'crm:campaign_list' %}" {% if 'campaign' in request.resolver_match.url_name %}aria-current="page"{% endif %}>Campaigns</a>
     <a href="{% url 'crm:schedule_list' %}" {% if 'schedule' in request.resolver_match.url_name %}aria-current="page"{% endif %}>Scheduled</a>
     {% if is_lead %}
@@ -33,6 +34,7 @@
     {% endif %}
 
     <div class="spacer"></div>
+    <a href="{% url 'crm:gmail_settings' %}" {% if 'gmail' in request.resolver_match.url_name %}aria-current="page"{% endif %}>Gmail{% if not member.gmail_connected %} <span class="badge badge-secondary">connect</span>{% endif %}</a>
     <a href="/admin/">Django admin</a>
   </nav>
 

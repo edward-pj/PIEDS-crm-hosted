@@ -30,23 +30,41 @@ until Tuesday.
 Everything below follows from that one fact. A scheduled send needs **a process that is awake at
 the scheduled moment and holds that member's Gmail OAuth token**.
 
-The CRM cannot be that process. Per the top-level design (README §2), the Django server holds the
-database and every rule, and *never* holds Gmail credentials — that is what lets fifteen people run
-agents on their own laptops without the server being able to impersonate any of them. Moving tokens
-server-side to make scheduling easy would trade away the property the whole system is built on.
+> ### ⚠️ This section described the pre-hosting design. It has been superseded.
+>
+> Everything below this box was written when the CRM ran on each member's laptop. The reasoning is
+> preserved because the *constraint* has not changed — Gmail still has no `sendAt` — but the answer
+> has. **The server now holds encrypted per-member refresh tokens and sends directly**
+> (`crm/services/gmail.py`, `crm/services/sending.py`, `crm/services/runner.py`), and
+> `local_agent/` is being retired.
+>
+> The argument below — that the CRM *cannot* be that process, because the server never holds Gmail
+> credentials — was correct and load-bearing at the time. It was given up deliberately, not
+> overlooked. The trade: a member can now sign in, press Send, and close the tab, and a scheduled
+> send fires whether or not anyone's laptop is on. What it costs is that a compromised server can
+> impersonate a member. What partly replaces it is in `crm/services/secrets.py` (tokens encrypted at
+> rest, so a database leak alone yields nothing), the identity binding in
+> `gmail.py::verify_identity`, and the fact that a member can revoke access from their own Google
+> account at any time.
+>
+> Read §2–§5 for the state machine, the lease protocol and the timing arithmetic: all of that is
+> unchanged and still accurate. Read §1's "what we are not doing" table as history.
 
 So the executor is an agent. The only question is *which* agent, and whether it happens to be
 running. That is the subject of §2.
 
 ### What we are not doing, and why
 
+*As judged before hosting. The first row is still true; the second and third still hold. The fourth
+and fifth are now about how the server sends, not whether it does.*
+
 | Option | Why not |
 |---|---|
-| `sendAt` on the Gmail API | Does not exist. |
-| Server sends via SMTP / SendGrid / SES | Mail would stop coming from a real human mailbox. Deliverability and reply-handling both depend on that (README §1). |
-| Gmail drafts + a Google Apps Script | A second codebase in a second language, with its own auth and its own failure modes, to schedule mail we already know how to send. |
-| Service account with domain-wide delegation | Needs Workspace admin over `pilani.bits-pilani.ac.in`. We do not have it. |
-| A cron job on the CRM host that shells into an agent | That *is* the always-on agent, minus the supervision, the lease and the error reporting. |
+| `sendAt` on the Gmail API | Does not exist. Still true, and still the reason any of this exists. |
+| Server sends via SMTP / SendGrid / SES | Mail would stop coming from a real human mailbox. Deliverability and reply-handling both depend on that (README §1). **Still rejected** — the server sends *through each member's own Gmail*, which is a different thing entirely. |
+| Gmail drafts + a Google Apps Script | A second codebase in a second language, with its own auth and its own failure modes, to schedule mail we already know how to send. Still rejected. |
+| Service account with domain-wide delegation | Needs Workspace admin over `pilani.bits-pilani.ac.in`. We do not have it. Per-member OAuth consent is what replaces it, and it needs no admin. |
+| A cron job on the CRM host that shells into an agent | ~~That *is* the always-on agent~~ — superseded. There is no agent to shell into. The equivalent today is an external pinger calling one endpoint; the free hosting tier has no cron of its own. |
 
 ---
 

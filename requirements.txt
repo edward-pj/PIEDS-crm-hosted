@@ -9,6 +9,11 @@ django-environ>=0.11
 whitenoise>=6.7
 gunicorn>=23.0
 
+# Encrypts Gmail refresh tokens at rest (crm/services/secrets.py). Also a
+# transitive dependency of google-auth, but named here because we import it
+# directly and the token store must not silently lose its encryption.
+cryptography>=43.0
+
 # --- local_agent (FastAPI sending agent) ---
 fastapi>=0.115
 uvicorn[standard]>=0.32
@@ -17,7 +22,10 @@ jinja2>=3.1
 google-api-python-client>=2.150
 google-auth-oauthlib>=1.2
 google-auth>=2.35
+# Pulled in transitively by google-api-core, but named because we import it
+# directly to revoke a token (crm/services/gmail_oauth.py::disconnect) and
+# `google.auth.transport.requests` requires it regardless.
+requests>=2.32
 
-# --- dev ---
-pytest>=8.3
-pytest-django>=4.9
+# Test-only dependencies live in requirements-dev.txt so they stay out of the
+# deployed image. Install both for local work:  pip install -r requirements-dev.txt

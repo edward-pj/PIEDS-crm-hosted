@@ -1,0 +1,11 @@
+# Everything in requirements.txt, plus the test tooling.
+#
+#   pip install -r requirements-dev.txt
+#
+# Kept separate so the deployed image carries no test runner: pytest.ini pins
+# the suite to a local database, and shipping a runner that can be pointed at
+# production by one environment variable is a risk with no upside.
+-r requirements.txt
+
+pytest>=8.3
+pytest-django>=4.9

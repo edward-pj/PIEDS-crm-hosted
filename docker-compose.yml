@@ -63,11 +63,10 @@ services:
       SEED_DEV: ${SEED_DEV:-}
     ports:
       - "8000:8000"
-    entrypoint: ["./docker/entrypoint-crm.sh"]
-    command:
-      ["gunicorn", "config.wsgi:application",
-       "--chdir", "/app/core_django",
-       "--bind", "0.0.0.0:8000", "--workers", "3", "--access-logfile", "-"]
+    # No entrypoint/command override. The image's CMD carries the full argv now
+    # (see Dockerfile), so compose and the hosting platform start the container
+    # identically -- which is the only way "it works in compose" means anything.
+    # Overriding `entrypoint:` here would silently blank `command:` as well.
 
   # The sending agent. Opt-in: `docker compose --profile agent up`.
   # It needs an API token that only exists once the CRM is running, and a Gmail
