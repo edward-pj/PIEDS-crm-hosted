@@ -1,0 +1,79 @@
+{% extends "crm/base.html" %}
+{% block title %}{{ team.name }} — Ignite CRM{% endblock %}
+{% block heading %}{{ team.name }}{% endblock %}
+
+{% block content %}
+<div class="col" style="gap:1rem">
+
+  <div class="card">
+    <header>
+      <h2>Join code</h2>
+      <p class="muted text-sm">
+        Read this out to new members. They sign in with their BITS Google
+        account first, then enter it — the code decides which team, Google
+        decides who.
+      </p>
+    </header>
+    <section class="col" style="gap:.75rem">
+      <code style="font-size:1.5rem;letter-spacing:.15em">{{ team.join_code }}</code>
+      <form method="post" action="{% url 'crm:team_rotate_code' team.pk %}">
+        {% csrf_token %}
+        <button type="submit" class="btn btn-outline btn-sm">Issue a new code</button>
+        <span class="muted text-sm">The current one stops working immediately.</span>
+      </form>
+    </section>
+  </div>
+
+  <div class="card">
+    <header><h2>Members</h2></header>
+    <section>
+      <table class="table">
+        <thead><tr><th>Name</th><th>Email</th><th>Role</th><th></th></tr></thead>
+        <tbody>
+          {% for m in memberships %}
+            <tr {% if not m.is_active %}class="muted"{% endif %}>
+              <td>{{ m.member.name }}</td>
+              <td class="muted text-sm">{{ m.member.bits_email }}</td>
+              <td>
+                <span class="badge{% if m.role != 'lead' %} badge-secondary{% endif %}">{{ m.role }}</span>
+                {% if not m.is_active %}<span class="badge badge-secondary">removed</span>{% endif %}
+              </td>
+              <td>
+                {% if m.is_active %}
+                  <form method="post" action="{% url 'crm:team_set_role' team.pk %}">
+                    {% csrf_token %}
+                    <input type="hidden" name="member" value="{{ m.member.pk }}">
+                    <input type="hidden" name="role" value="{% if m.role == 'lead' %}member{% else %}lead{% endif %}">
+                    <button type="submit" class="btn-ghost btn-sm">
+                      Make {% if m.role == 'lead' %}member{% else %}lead{% endif %}
+                    </button>
+                  </form>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+  </div>
+
+  <div class="card">
+    <header>
+      <h2>Campaigns</h2>
+      <p class="muted text-sm">Root campaigns belonging to this team.</p>
+    </header>
+    <section>
+      {% for c in campaigns %}
+        <div class="row" style="gap:.5rem;align-items:center">
+          <a href="{% url 'crm:campaign_detail' c.pk %}">{{ c.title }}</a>
+          <span class="badge badge-secondary">{{ c.status }}</span>
+        </div>
+      {% empty %}
+        <p class="muted">No campaigns yet.</p>
+      {% endfor %}
+      <a class="btn btn-sm mt-2" href="{% url 'crm:team_distribute' team.pk %}">Distribute contacts</a>
+    </section>
+  </div>
+
+</div>
+{% endblock %}

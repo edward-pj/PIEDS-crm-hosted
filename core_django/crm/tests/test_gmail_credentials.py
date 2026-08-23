@@ -439,7 +439,7 @@ class TestSendPage:
     def test_it_lists_only_my_unmailed_contacts(self, client, member, campaign, contact):
         other = TeamMember.objects.create(
             name="Aarav", bits_email="aarav@pilani.bits-pilani.ac.in", batch="2024"
-        )
+        )  # not a lead: no membership, and batch alone grants nothing now
         theirs = Contact.objects.create(
             first_name="Someone", email="someone@example.com",
             company="Elsewhere", assigned_to=other,

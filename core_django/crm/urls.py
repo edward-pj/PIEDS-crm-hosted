@@ -36,6 +36,12 @@ urlpatterns = [
     path("settings/gmail/connect/", views.gmail_connect, name="gmail_connect"),
     path("settings/gmail/disconnect/", views.gmail_disconnect, name="gmail_disconnect"),
 
+    path("teams/", views.team_list, name="team_list"),
+    path("teams/<uuid:pk>/", views.team_detail, name="team_detail"),
+    path("teams/<uuid:pk>/code/", views.team_rotate_code, name="team_rotate_code"),
+    path("teams/<uuid:pk>/role/", views.team_set_role, name="team_set_role"),
+    path("teams/<uuid:pk>/distribute/", views.team_distribute, name="team_distribute"),
+
     path("members/", views.member_list, name="member_list"),
     path("members/<uuid:pk>/sender-name/", views.member_sender_name, name="member_sender_name"),
     path("members/tokens/issue/", views.token_issue, name="token_issue"),

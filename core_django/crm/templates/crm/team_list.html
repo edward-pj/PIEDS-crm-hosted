@@ -1,0 +1,45 @@
+{% extends "crm/base.html" %}
+{% block title %}Teams — Ignite CRM{% endblock %}
+{% block heading %}Teams{% endblock %}
+
+{% block content %}
+{% if not teams %}
+  <div class="card"><section>
+    <p class="muted">
+      You are not on a team yet. Ask a lead for a join code — or, if you are
+      setting this up for the first time, create a team in
+      <a href="/admin/crm/team/add/">the admin</a> and read its code out.
+    </p>
+  </section></div>
+{% endif %}
+
+<div class="col" style="gap:1rem">
+  {% for team in teams %}
+    <div class="card">
+      <header>
+        <h2>{{ team.name }}</h2>
+        <p class="muted text-sm">
+          {{ team.memberships.count }} member(s){% if team.id in led %} · you lead this team{% endif %}
+        </p>
+      </header>
+      <section>
+        <div class="row" style="gap:.5rem;flex-wrap:wrap">
+          {% for m in team.memberships.all %}
+            {% if m.is_active %}
+              <span class="badge{% if m.role == 'lead' %}{% else %} badge-secondary{% endif %}">
+                {{ m.member.name }}{% if m.role == 'lead' %} · lead{% endif %}
+              </span>
+            {% endif %}
+          {% endfor %}
+        </div>
+        {% if team.id in led %}
+          <div class="row mt-2" style="gap:.5rem">
+            <a class="btn btn-outline btn-sm" href="{% url 'crm:team_detail' team.pk %}">Manage</a>
+            <a class="btn btn-sm" href="{% url 'crm:team_distribute' team.pk %}">Distribute contacts</a>
+          </div>
+        {% endif %}
+      </section>
+    </div>
+  {% endfor %}
+</div>
+{% endblock %}

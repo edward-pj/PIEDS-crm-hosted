@@ -6,6 +6,34 @@
 {# One stable [data-poll] wrapper: the failures card below is conditional, and
    a container count that changes between loads would abort the swap. #}
 <div data-poll>
+
+{% if not gmail_connected %}
+  <div class="alert alert-destructive mb-3">
+    <section>
+      <p><strong>Gmail is not connected</strong>, so you cannot send yet.</p>
+      <p class="text-sm"><a href="{% url 'crm:gmail_settings' %}">Connect it now</a> — it takes one click and you only do it once.</p>
+    </section>
+  </div>
+{% endif %}
+
+{% if my_queue %}
+  <div class="card mb-3">
+    <header>
+      <h2>Your mail</h2>
+      <p class="muted text-sm">Assigned to you and not yet sent.</p>
+    </header>
+    <section class="col" style="gap:.5rem">
+      {% for row in my_queue %}
+        <div class="row" style="gap:.75rem;align-items:center">
+          <span class="badge">{{ row.pending }}</span>
+          <span>{{ row.campaign.title }}</span>
+          <a class="btn btn-sm" href="{% url 'crm:send' %}?campaign={{ row.campaign.id }}">Send these</a>
+        </div>
+      {% endfor %}
+    </section>
+  </div>
+{% endif %}
+
 <div class="grid grid-4 mb-3">
   <div class="card"><section class="stat">
     <div class="value">{{ my_contacts }}</div><div class="label">assigned to me</div>

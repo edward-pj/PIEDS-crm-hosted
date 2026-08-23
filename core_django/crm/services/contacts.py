@@ -37,9 +37,16 @@ EDITABLE_FIELDS = frozenset({
     "linkedin", "company", "designation", "tags",
 })
 
-#: Only a lead may set this one by hand. The automatic NEW -> CONTACTED
-#: transition lives in services/mailing.py::record_result.
-LEAD_ONLY_FIELDS = frozenset({"lifecycle"})
+#: Only a lead may set these by hand. The automatic NEW -> CONTACTED transition
+#: lives in services/mailing.py::record_result.
+#:
+#: `assigned_to` is here because the edit form has always OFFERED it to leads
+#: while `update()` silently dropped it -- the page said "Saved." and nothing
+#: changed. Wiring it through is the honest fix; the alternative was removing a
+#: control leads reasonably expect. It routes through assignment.bulk_assign
+#: below rather than being set directly, so the reassign guard and the audit row
+#: apply exactly as they do on the bulk screen.
+LEAD_ONLY_FIELDS = frozenset({"lifecycle", "assigned_to"})
 
 
 @dataclass
@@ -126,8 +133,26 @@ def update(contact: Contact, data: dict, actor) -> Contact:
     allowed = _permitted_fields(actor)
     changes = []
 
+    # Reassignment is not an ordinary field write: it has a guard (a contact
+    # mid-conversation must not move silently) and its own audit row. Handled
+    # first and separately so the loop below stays a plain field diff.
+    if "assigned_to" in allowed and "assigned_to" in data:
+        new_owner = data.get("assigned_to")
+        if new_owner is not None and new_owner.id != contact.assigned_to_id:
+            from . import assignment as assignment_svc
+
+            result = assignment_svc.bulk_assign(
+                [contact.id], new_owner, actor=actor,
+                force=data.get("force_reassign", False),
+            )
+            if result.skipped:
+                raise ValidationError(
+                    f"Could not reassign: {result.skipped[0][1]}."
+                )
+            contact.refresh_from_db()
+
     for name, value in data.items():
-        if name not in allowed:
+        if name not in allowed or name == "assigned_to":
             continue  # silently dropped -- lifecycle for a non-lead lands here
         if name == "tags":
             value = clean_tags(value)

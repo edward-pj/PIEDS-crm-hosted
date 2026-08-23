@@ -24,18 +24,19 @@ from crm.services import contacts as contact_svc
 from crm.services import mailing as mailing_svc
 from shared.enums import CampaignStatus, ContactLifecycle, MailingStatus
 
+from .conftest import make_lead
+
 pytestmark = pytest.mark.django_db
 
 
 # ---------------------------------------------------------------- fixtures
 
 @pytest.fixture
-def lead():
+def lead(team):
+    """A lead is now a ROLE on a team, not a batch. `make_lead` is the only
+    correct way to build one -- see tests/conftest.py."""
     user = User.objects.create_user("aarav", password="x")
-    return TeamMember.objects.create(
-        name="Aarav", bits_email="aarav@pilani.bits-pilani.ac.in",
-        batch="2024", user=user,
-    )
+    return make_lead(team, user=user)
 
 
 @pytest.fixture

@@ -22,14 +22,14 @@ from crm.services import mailing
 from crm.services.render import render
 from shared.enums import CampaignStatus, MailingStatus
 
+from .conftest import make_lead
+
 pytestmark = pytest.mark.django_db
 
 
 @pytest.fixture
-def lead():
-    return TeamMember.objects.create(
-        name="Aarav", bits_email="aarav@pilani.bits-pilani.ac.in", batch="2024"
-    )
+def lead(team):
+    return make_lead(team)
 
 
 @pytest.fixture

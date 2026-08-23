@@ -10,8 +10,8 @@ from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 
-from crm.models import Campaign, Contact, TeamMember
-from shared.enums import LEAD_BATCH, CampaignStatus, ContactLifecycle
+from crm.models import Campaign, Contact, Team, TeamMember, TeamMembership
+from shared.enums import CampaignStatus, ContactLifecycle
 
 #: Seeding writes fixture contacts and an active campaign. Doing that to the
 #: database the whole team shares would put invented prospects in a real pool --
@@ -20,12 +20,17 @@ from shared.enums import LEAD_BATCH, CampaignStatus, ContactLifecycle
 #: well because a person typing the command by hand deserves the same guard.
 LOCAL_HOSTS = {"", "localhost", "127.0.0.1", "::1", "postgres"}
 
+#: (name, email, batch, phone, role). The batch is a display field now; the
+#: role is what grants anything.
 MEMBERS = [
-    ("Aarav Sharma", "aarav@pilani.bits-pilani.ac.in", "2024", "9812345670"),
-    ("Diya Menon", "diya@pilani.bits-pilani.ac.in", "2024", "9812345671"),
-    ("Kabir Rao", "kabir@pilani.bits-pilani.ac.in", "2025", "9812345672"),
-    ("Ishita Nair", "ishita@pilani.bits-pilani.ac.in", "2025", "9812345673"),
+    ("Aarav Sharma", "aarav@pilani.bits-pilani.ac.in", "2024", "9812345670", "lead"),
+    ("Diya Menon", "diya@pilani.bits-pilani.ac.in", "2024", "9812345671", "lead"),
+    ("Kabir Rao", "kabir@pilani.bits-pilani.ac.in", "2025", "9812345672", "member"),
+    ("Ishita Nair", "ishita@pilani.bits-pilani.ac.in", "2025", "9812345673", "member"),
 ]
+
+SEED_TEAM_NAME = "PIEDS Outreach"
+SEED_JOIN_CODE = "DEVCODE123"
 
 COMPANIES = [
     "Zerodha", "Razorpay", "Postman", "Freshworks", "Zoho", "CRED", "Groww",
@@ -61,19 +66,30 @@ class Command(BaseCommand):
         random.seed(42)
 
         members = []
-        for name, email, batch, phone in MEMBERS:
+        team, _ = Team.objects.update_or_create(
+            name=SEED_TEAM_NAME,
+            defaults={"join_code": SEED_JOIN_CODE, "is_active": True},
+        )
+
+        for name, email, batch, phone, role in MEMBERS:
             member, _ = TeamMember.objects.update_or_create(
                 bits_email=email,
                 defaults={"name": name, "batch": batch, "phone": phone},
             )
+            TeamMembership.objects.update_or_create(
+                team=team, member=member,
+                defaults={"role": role, "is_active": True},
+            )
             members.append(member)
 
-        # No Django Users: the CRM signs people in by name (batch 2024) or with
-        # Google (batch 2025). `manage.py createsuperuser` is for /admin/ only.
-        leads = [m.name for m in members if m.batch == LEAD_BATCH]
+        # No Django Users: everyone signs in with Google, and a new person joins
+        # with the team's code. `manage.py createsuperuser` is for /admin/ only.
+        leads = [name for name, _e, _b, _p, role in MEMBERS if role == "lead"]
         self.stdout.write(
-            f"team members: {len(members)} — sign in by picking a name: {', '.join(leads)}"
+            f"team members: {len(members)} on {team.name!r} — "
+            f"leads: {', '.join(leads)}"
         )
+        self.stdout.write(f"join code: {team.join_code}")
 
         assignees = [m for m in members if m.batch == "2025"]
         created = 0

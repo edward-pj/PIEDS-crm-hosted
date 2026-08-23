@@ -27,10 +27,12 @@
     <a href="{% url 'crm:send' %}" {% if request.resolver_match.url_name == 'send' %}aria-current="page"{% endif %}>Send</a>
     <a href="{% url 'crm:campaign_list' %}" {% if 'campaign' in request.resolver_match.url_name %}aria-current="page"{% endif %}>Campaigns</a>
     <a href="{% url 'crm:schedule_list' %}" {% if 'schedule' in request.resolver_match.url_name %}aria-current="page"{% endif %}>Scheduled</a>
+    {# Everyone can see their own team; only leads can manage it. #}
+    <a href="{% url 'crm:team_list' %}" {% if 'team' in request.resolver_match.url_name %}aria-current="page"{% endif %}>Teams</a>
     {% if is_lead %}
       <a href="{% url 'crm:assign' %}" {% if request.resolver_match.url_name == 'assign' %}aria-current="page"{% endif %}>Assign</a>
       <a href="{% url 'crm:contact_import' %}" {% if request.resolver_match.url_name == 'contact_import' %}aria-current="page"{% endif %}>Import CSV</a>
-      <a href="{% url 'crm:member_list' %}" {% if 'member' in request.resolver_match.url_name %}aria-current="page"{% endif %}>Team &amp; Tokens</a>
+      <a href="{% url 'crm:member_list' %}" {% if 'member' in request.resolver_match.url_name %}aria-current="page"{% endif %}>Members</a>
     {% endif %}
 
     <div class="spacer"></div>

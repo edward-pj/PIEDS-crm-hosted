@@ -19,6 +19,7 @@ urlpatterns = [
     # tests/test_login.py::test_the_name_login_route_is_gone will fail if you do.
     path("login/google/", auth_views.google_login, name="google_login"),
     path("login/google/callback/", auth_views.google_callback, name="google_callback"),
+    path("join/", auth_views.join, name="join"),
     path("logout/", auth_views.logout_view, name="logout"),
 
     # A registered redirect URI in Google Cloud Console. Kept at the top level,

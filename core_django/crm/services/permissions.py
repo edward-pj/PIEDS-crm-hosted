@@ -1,8 +1,17 @@
 """The one place that defines what a "lead" is.
 
-The permission rule is "batch 2024 members may assign contacts". That literal
-lives in shared/enums.py::LEAD_BATCH and is read only from here, so changing
-which batch leads next year is a one-line edit.
+A lead is someone with the `lead` role on an active team. It used to be
+`member.batch == "2024"` -- a literal that had to be edited every year, could
+not express "lead of this team but not that one", and made the permission system
+a fact about when somebody was admitted to university.
+
+`is_lead(member)` keeps its one-argument signature on purpose. It answers "is
+this person a lead of anything", which is the right question for the ~22
+decorator call sites, the template context and the contact-level rules, and
+keeping it means none of them changed when the rule underneath did. Questions
+that are genuinely about one team get their own function -- see
+`assignable_members` -- rather than a second argument that every caller would
+have to start passing.
 """
 
 from functools import wraps
@@ -10,7 +19,13 @@ from functools import wraps
 from django.core.exceptions import PermissionDenied
 from django.shortcuts import redirect
 
-from shared.enums import LEAD_BATCH
+#: Cached on the resolved member instance, not in a module-level dict. `is_lead`
+#: is called by `lead_required` on every guarded request AND again by `_base`
+#: for the template context, so without this a page costs two extra queries for
+#: an answer that cannot change within one request. Per-instance means it dies
+#: with the request, which is what makes it safe: a role change takes effect on
+#: the member's next page load, not at their next login.
+_LEAD_CACHE_ATTR = "_is_lead_cached"
 
 
 def get_member(request):
@@ -24,7 +39,68 @@ def get_member(request):
 
 
 def is_lead(member) -> bool:
-    return bool(member and member.is_active and member.batch == LEAD_BATCH)
+    """Whether `member` leads any active team.
+
+    `team__is_active=True` is deliberate rather than incidental: a lead of a
+    defunct team must not keep global powers over the contact pool forever.
+    """
+    if not member or not member.is_active:
+        return False
+
+    cached = getattr(member, _LEAD_CACHE_ATTR, None)
+    if cached is not None:
+        return cached
+
+    answer = member.memberships.filter(
+        role="lead", is_active=True, team__is_active=True
+    ).exists()
+    setattr(member, _LEAD_CACHE_ATTR, answer)
+    return answer
+
+
+def led_teams(member):
+    """The active teams `member` leads."""
+    from crm.models import Team
+
+    if not member or not member.is_active:
+        return Team.objects.none()
+    return Team.objects.filter(
+        is_active=True, memberships__member=member,
+        memberships__role="lead", memberships__is_active=True,
+    ).distinct()
+
+
+def teams_of(member):
+    """Every active team `member` belongs to, whatever their role."""
+    from crm.models import Team
+
+    if not member or not member.is_active:
+        return Team.objects.none()
+    return Team.objects.filter(
+        is_active=True, memberships__member=member, memberships__is_active=True
+    ).distinct()
+
+
+def assignable_members(actor):
+    """Who `actor` may assign contacts to: the members of the teams they lead.
+
+    A separate function rather than `is_lead(member, team)`, because this is the
+    question the assign screen, the contact form and the round-robin actually
+    ask -- and answering it directly means the contact-level rules below keep
+    working verbatim. Replaces the unfiltered
+    `TeamMember.objects.filter(is_active=True)` those three used before, which
+    would let a lead of one cohort assign work to another cohort's members.
+    """
+    from crm.models import TeamMember
+
+    if not is_lead(actor):
+        return TeamMember.objects.none()
+
+    return TeamMember.objects.filter(
+        is_active=True,
+        memberships__is_active=True,
+        memberships__team__in=led_teams(actor),
+    ).distinct()
 
 
 def lead_required(view_func):
@@ -39,7 +115,8 @@ def lead_required(view_func):
             return redirect("login")
         if not is_lead(member):
             raise PermissionDenied(
-                f"Only active batch-{LEAD_BATCH} members may access this page."
+                "Only team leads may access this page. Ask a lead to change "
+                "your role if you should have access."
             )
         request.member = member
         return view_func(request, *args, **kwargs)

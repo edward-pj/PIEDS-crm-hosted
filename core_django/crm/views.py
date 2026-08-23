@@ -41,10 +41,13 @@ from .services import mailing
 from .services import gmail as gmail_svc
 from .services import gmail_oauth
 from .services import secrets as token_store
+from .services import permissions
+from .services import teams as team_svc
 from .services import scheduling as schedule_svc
 from .services import campaigns as campaign_svc
 from .services import contacts as contact_svc
 from .services.permissions import (
+    assignable_members,
     can_edit_contact,
     can_hard_delete,
     is_lead,
@@ -94,8 +97,23 @@ def home(request):
         CampaignMailing.objects.filter(status=MailingStatus.FAILED.value)
         .select_related("contact", "campaign", "sent_by")[:8]
     )
+    # What this member actually has to do, for the team's active campaigns.
+    # The landing page answering "what is my work" rather than "how is the team
+    # doing" is the whole point of the migration -- a member should sign in and
+    # see their queue, not a dashboard they have to interpret.
+    my_queue = []
+    for root in Campaign.objects.filter(
+        status=CampaignStatus.ACTIVE.value, parent__isnull=True
+    ).order_by("title")[:5]:
+        pending = _send_queue(request.member, root).count()
+        if pending:
+            my_queue.append({"campaign": root, "pending": pending})
+
     return render(request, "crm/home.html", _base(
         request,
+        my_queue=my_queue,
+        my_lifecycles=contact_svc.lifecycle_counts(request.member.assigned_contacts.all()),
+        gmail_connected=gmail_svc.has_usable_credential(request.member),
         my_contacts=request.member.assigned_contacts.count(),
         total_contacts=Contact.objects.count(),
         unassigned=Contact.objects.filter(assigned_to__isnull=True).count(),
@@ -154,8 +172,10 @@ def _filter_context(request):
                             .values_list("company", flat=True).distinct(),
         "all_tags": contact_svc.all_tags(),
         "lifecycles": ContactLifecycle.choices(),
-        "members": TeamMember.objects.filter(is_active=True)
-                           .annotate(load=Count("assigned_contacts")),
+        # Who this lead may assign to -- their own teams' members. See
+        # services/permissions.py::assignable_members.
+        "members": assignable_members(request.member)
+                   .annotate(load=Count("assigned_contacts")),
     }
 
 
@@ -342,6 +362,19 @@ def assign(request):
     return render(request, "crm/assign.html", _base(request, page=page, total=qs.count(), **ctx))
 
 
+def _report_skipped(request, skipped):
+    """Surface refusals rather than dropping them silently.
+
+    bulk_assign refuses to move a contact that already has mail history under
+    someone else. The lead needs to decide, and can re-post with force.
+    """
+    if not skipped:
+        return
+    detail = "; ".join(f"{email} ({reason})" for email, reason in skipped[:5])
+    more = f" …and {len(skipped) - 5} more" if len(skipped) > 5 else ""
+    messages.error(request, f"Skipped {len(skipped)}: {detail}{more}")
+
+
 @lead_required
 @require_POST
 def assign_apply(request):
@@ -353,19 +386,29 @@ def assign_apply(request):
         messages.error(request, "No contacts selected.")
         return redirect(redirect_to)
 
+    force = request.POST.get("force") == "1"
+
     if action == "unassign":
-        count = assignment.bulk_unassign(contact_ids)
-        messages.success(request, f"Unassigned {count} contact(s).")
+        result = assignment.bulk_unassign(
+            contact_ids, actor=request.member, force=force
+        )
+        messages.success(request, f"Unassigned {result.assigned} contact(s).")
+        _report_skipped(request, result.skipped)
         return redirect(redirect_to)
 
-    member = TeamMember.objects.filter(pk=request.POST.get("member")).first()
+    # Resolved through assignable_members, not TeamMember.objects: a lead may
+    # only hand work to their own teams' members, and a posted member id from
+    # another cohort must find nothing rather than being honoured.
+    member = assignable_members(request.member).filter(
+        pk=request.POST.get("member")
+    ).first()
     if not member:
-        messages.error(request, "Pick a team member to assign to.")
+        messages.error(request, "Pick a member of one of your teams to assign to.")
         return redirect(redirect_to)
 
     try:
         result = assignment.bulk_assign(
-            contact_ids, member, force=request.POST.get("force") == "1"
+            contact_ids, member, actor=request.member, force=force
         )
     except ValidationError as exc:
         messages.error(request, "; ".join(exc.messages))
@@ -377,11 +420,7 @@ def assign_apply(request):
     # bulk_assign refuses to move a contact that already has mail history under
     # someone else. Surface those rather than dropping them silently -- the
     # lead needs to decide, and can re-post with force.
-    if result.skipped:
-        detail = "; ".join(f"{email} ({reason})" for email, reason in result.skipped[:5])
-        more = f" …and {len(result.skipped) - 5} more" if len(result.skipped) > 5 else ""
-        messages.error(request, f"Skipped {len(result.skipped)}: {detail}{more}")
-
+    _report_skipped(request, result.skipped)
     return redirect(redirect_to)
 
 
@@ -851,4 +890,115 @@ def my_footer(request, pk):
     return render(request, "crm/footer_form.html", _base(
         request, form=form, root=root, sub=sub,
         preview=preview, preview_error=preview_error, sample=sample,
+    ))
+
+
+# ------------------------------------------------------------------- teams
+
+
+@member_required
+def team_list(request):
+    return render(request, "crm/team_list.html", _base(
+        request,
+        teams=permissions.teams_of(request.member).prefetch_related(
+            "memberships__member"
+        ),
+        led=set(permissions.led_teams(request.member).values_list("id", flat=True)),
+    ))
+
+
+@lead_required
+def team_detail(request, pk):
+    team = get_object_or_404(permissions.led_teams(request.member), pk=pk)
+    return render(request, "crm/team_detail.html", _base(
+        request,
+        team=team,
+        memberships=team.memberships.select_related("member").order_by(
+            "-role", "member__name"
+        ),
+        campaigns=Campaign.objects.filter(team=team, parent__isnull=True),
+    ))
+
+
+@lead_required
+@require_POST
+def team_rotate_code(request, pk):
+    team = get_object_or_404(permissions.led_teams(request.member), pk=pk)
+    code = team_svc.rotate_join_code(team, request.member)
+    messages.success(
+        request,
+        f"New join code: {code}. The old one stopped working immediately.",
+    )
+    return redirect("crm:team_detail", pk=team.pk)
+
+
+@lead_required
+@require_POST
+def team_set_role(request, pk):
+    team = get_object_or_404(permissions.led_teams(request.member), pk=pk)
+    member = get_object_or_404(TeamMember, pk=request.POST.get("member"))
+    try:
+        team_svc.set_role(team, member, request.POST.get("role", ""), actor=request.member)
+    except ValidationError as exc:
+        messages.error(request, "; ".join(exc.messages))
+    else:
+        messages.success(request, f"{member.name} is now a {request.POST.get('role')}.")
+    return redirect("crm:team_detail", pk=team.pk)
+
+
+@lead_required
+def team_distribute(request, pk):
+    """Split a filtered slice of the pool across the team, round-robin.
+
+    Two steps on purpose: preview, then commit. Reassignment is refused for
+    anyone already mid-conversation, so a distribution is not something a lead
+    can casually undo -- they should see the split before it happens.
+    """
+    team = get_object_or_404(permissions.led_teams(request.member), pk=pk)
+    # `team_members`, not `members`: _filter_context already puts a `members`
+    # key in the context for the filter dropdown, and shadowing it would make
+    # the "assigned to" filter list the wrong people.
+    team_members = list(
+        TeamMember.objects.filter(
+            memberships__team=team, memberships__is_active=True, is_active=True
+        ).distinct().order_by("name")
+    )
+
+    qs, ctx = _filter_context(request)
+    root = None
+    if request.POST.get("campaign") or request.GET.get("campaign"):
+        root = Campaign.objects.filter(
+            pk=request.POST.get("campaign") or request.GET.get("campaign"),
+            parent__isnull=True,
+        ).first()
+
+    plan, committed = None, False
+    if request.method == "POST" and team_members:
+        contacts = list(qs[:1000])
+        try:
+            if request.POST.get("action") == "commit":
+                plan = assignment.distribute(
+                    contacts, team_members, actor=request.member, root_campaign=root
+                )
+                committed = True
+                messages.success(
+                    request,
+                    f"Distributed {plan.total} contact(s) across "
+                    f"{len(team_members)} member(s).",
+                )
+            else:
+                plan = assignment.plan_distribution(
+                    contacts, team_members, root_campaign=root
+                )
+        except ValidationError as exc:
+            messages.error(request, "; ".join(exc.messages))
+
+    return render(request, "crm/team_distribute.html", _base(
+        request, **ctx,
+        team=team, team_members=team_members, plan=plan, committed=committed,
+        root=root,
+        campaigns=Campaign.objects.filter(
+            team=team, parent__isnull=True, status=CampaignStatus.ACTIVE.value
+        ),
+        pool_size=qs.count(),
     ))

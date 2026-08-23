@@ -13,14 +13,14 @@ from crm.services import campaigns as campaign_svc
 from crm.services.permissions import is_lead
 from shared.enums import CampaignStatus, MailingStatus
 
+from .conftest import make_lead, make_member
+
 pytestmark = pytest.mark.django_db
 
 
 @pytest.fixture
-def member():
-    return TeamMember.objects.create(
-        name="Aarav", bits_email="aarav@pilani.bits-pilani.ac.in", batch="2024"
-    )
+def member(team):
+    return make_lead(team)
 
 
 @pytest.fixture
@@ -96,18 +96,44 @@ def test_non_bits_email_is_rejected():
 
 
 class TestPermissions:
-    def test_2024_member_is_a_lead(self, member):
+    """A lead is a ROLE on an active team. The batch grants nothing."""
+
+    def test_a_lead_role_makes_a_lead(self, member):
         assert is_lead(member) is True
 
-    def test_2025_member_is_not_a_lead(self):
-        m = TeamMember.objects.create(
-            name="Kabir", bits_email="kabir@pilani.bits-pilani.ac.in", batch="2025"
+    def test_the_batch_alone_grants_nothing(self, team):
+        """The old rule was `batch == "2024"`. This member has that batch and no
+        membership, and must not be a lead -- otherwise the flip did not
+        actually happen and every graduating year re-opens the hole."""
+        stale = TeamMember.objects.create(
+            name="Ghost", bits_email="ghost@pilani.bits-pilani.ac.in", batch="2024"
         )
-        assert is_lead(m) is False
+        assert is_lead(stale) is False
+
+    def test_an_ordinary_member_is_not_a_lead(self, team):
+        assert is_lead(make_member(team)) is False
 
     def test_inactive_lead_is_not_a_lead(self, member):
         member.is_active = False
         assert is_lead(member) is False
+
+    def test_a_lead_of_a_defunct_team_keeps_no_powers(self, team, member):
+        """Otherwise last year's leads hold the contact pool forever."""
+        assert is_lead(member) is True
+        team.is_active = False
+        team.save()
+
+        # Re-fetched, not refresh_from_db(): the answer is cached on the
+        # INSTANCE, and refresh_from_db reloads field values without clearing
+        # attributes set on it. That is the intended lifetime -- get_member()
+        # resolves a fresh TeamMember per request, so a role change takes effect
+        # on the member's next page load. Re-fetching here is what a second
+        # request does.
+        assert is_lead(TeamMember.objects.get(pk=member.pk)) is False
+
+    def test_a_deactivated_membership_revokes_the_role(self, team, member):
+        member.memberships.update(is_active=False)
+        assert is_lead(TeamMember.objects.get(pk=member.pk)) is False
 
 
 class TestCampaignTransitions:

@@ -1,0 +1,89 @@
+{% extends "crm/base.html" %}
+{% block title %}Distribute — {{ team.name }}{% endblock %}
+{% block heading %}Distribute contacts{% endblock %}
+
+{% block content %}
+
+{% if not team_members %}
+  <div class="alert alert-destructive"><section>
+    <p>No active members on {{ team.name }} yet. Share the join code first.</p>
+  </section></div>
+{% else %}
+
+<form method="post">
+  {% csrf_token %}
+
+  <div class="card mb-2">
+    <header>
+      <h2>What to split</h2>
+      <p class="muted text-sm">
+        {{ pool_size }} contact(s) match the current filters, across
+        {{ team_members|length }} member(s).
+      </p>
+    </header>
+    <section class="col" style="gap:1rem">
+      {% include "crm/_filters.html" %}
+
+      <div class="col" style="gap:.25rem">
+        <label class="label" for="campaign">For campaign (optional)</label>
+        <select class="select" name="campaign" id="campaign">
+          <option value="">Any — just assign</option>
+          {% for c in campaigns %}
+            <option value="{{ c.id }}" {% if root and c.id == root.id %}selected{% endif %}>{{ c.title }}</option>
+          {% endfor %}
+        </select>
+        <p class="text-sm muted">
+          Choosing one skips anyone the team has already mailed for it — the
+          assignment-time half of the rule the database enforces at send time.
+        </p>
+      </div>
+
+      <div class="row" style="gap:.5rem">
+        <button type="submit" name="action" value="preview" class="btn btn-outline">
+          Preview the split
+        </button>
+        {% if plan and not committed %}
+          <button type="submit" name="action" value="commit" class="btn">
+            Distribute {{ plan.total }} contact(s)
+          </button>
+        {% endif %}
+      </div>
+    </section>
+  </div>
+
+  {% if plan %}
+    <div class="card">
+      <header>
+        <h2>{% if committed %}Distributed{% else %}Preview{% endif %}</h2>
+        {% if not committed %}
+          <p class="muted text-sm">Nothing has been written yet.</p>
+        {% endif %}
+      </header>
+      <section>
+        <table class="table">
+          <thead><tr><th>Member</th><th>Contacts</th></tr></thead>
+          <tbody>
+            {% for member, contacts in plan.per_member.items %}
+              <tr>
+                <td>{{ member.name }}</td>
+                <td>{{ contacts|length }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+
+        {% if plan.skipped %}
+          <p class="muted text-sm mt-2">
+            Skipped {{ plan.skipped|length }}:
+            {% for email, reason in plan.skipped|slice:":5" %}
+              {{ email }} ({{ reason }}){% if not forloop.last %}; {% endif %}
+            {% endfor %}
+          </p>
+        {% endif %}
+      </section>
+    </div>
+  {% endif %}
+</form>
+
+{% endif %}
+{% endblock %}

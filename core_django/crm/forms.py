@@ -7,7 +7,7 @@ from .models import Campaign, Contact, ContactNote, TeamMember
 from .services.campaigns import ALLOWED_VARIABLES, extract_placeholders, validate_footer
 from .services.contacts import clean_tags
 from .services.richtext import validate_links, validate_markup
-from .services.permissions import can_set_lifecycle, is_lead
+from .services.permissions import assignable_members, can_set_lifecycle, is_lead
 
 
 class BasecoatMixin:
@@ -184,7 +184,10 @@ class ContactForm(BasecoatMixin, forms.ModelForm):
         if not is_lead(actor):
             self.fields.pop("assigned_to", None)
         else:
-            self.fields["assigned_to"].queryset = TeamMember.objects.filter(is_active=True)
+            # Only members of the teams this lead actually leads. The old
+            # unfiltered queryset would let a lead of one cohort hand work to
+            # another cohort's members.
+            self.fields["assigned_to"].queryset = assignable_members(actor)
             self.fields["assigned_to"].required = False
 
     def clean_tags_raw(self):

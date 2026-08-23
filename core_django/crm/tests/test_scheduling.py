@@ -20,6 +20,8 @@ from crm.models import ApiToken, Campaign, CampaignMailing, Contact, ScheduledSe
 from crm.services import scheduling as svc
 from shared.enums import CampaignStatus, ContactLifecycle, MailingStatus, ScheduleStatus
 
+from .conftest import make_lead
+
 pytestmark = pytest.mark.django_db
 
 
@@ -437,10 +439,8 @@ def test_api_progress_and_cancel_round_trip(client, auth, campaign, member, cont
 # ------------------------------------------------------- the CRM schedule page
 
 @pytest.fixture
-def lead():
-    return TeamMember.objects.create(
-        name="Aarav", bits_email="aarav@pilani.bits-pilani.ac.in", batch="2024"
-    )
+def lead(team):
+    return make_lead(team)
 
 
 def sign_in(client, who):

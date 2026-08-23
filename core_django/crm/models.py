@@ -100,6 +100,96 @@ class TeamMember(TimeStampedModel):
             return False
 
 
+class Team(TimeStampedModel):
+    """A cohort that works one contact pool together.
+
+    Replaces the admission year as the unit of permission. `LEAD_BATCH = "2024"`
+    was the entire permission system: a hard-coded literal that had to be edited
+    every year, could not express "lead of this campaign but not that one", and
+    said nothing at all about which members belong together.
+
+    The join code is what makes a team self-serve. A lead creates the team, reads
+    the code out once, and everyone else is in -- with no lead needed at a
+    keyboard to add each person, and no password-free door on a public hostname.
+    """
+
+    name = models.CharField(max_length=120)
+
+    #: Handed out once, verbally or in a group chat, then rotated. Unique and
+    #: indexed because /join/ looks a member up by it on every attempt.
+    join_code = models.CharField(max_length=32, unique=True, db_index=True)
+
+    #: Seeded into each new sub-campaign's footer, so a member who never edits
+    #: theirs still signs off as somebody rather than as nobody.
+    default_footer = models.TextField(blank=True)
+
+    is_active = models.BooleanField(default=True)
+    created_by = models.ForeignKey(
+        TeamMember, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="teams_created",
+    )
+
+    class Meta:
+        db_table = "teams"
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+    @staticmethod
+    def generate_join_code() -> str:
+        """A code that survives being read aloud.
+
+        `secrets`, not `random`: this is the only credential standing between a
+        BITS address and the contact pool.
+
+        The alphabet omits O/0, I/1/L and U/V -- a code dictated across a room
+        and typed back wrong is a support request, and every ambiguous pair
+        removed is one fewer. 10 characters from a 28-symbol alphabet is ~48
+        bits, which is not guessable at the rate /join/ permits.
+        """
+        alphabet = "ABCDEFGHJKMNPQRSTWXYZ23456789"
+        return "".join(secrets.choice(alphabet) for _ in range(10))
+
+
+class TeamRole(models.TextChoices):
+    LEAD = "lead", "Lead"
+    MEMBER = "member", "Member"
+
+
+class TeamMembership(TimeStampedModel):
+    """Who is on a team, and what they may do there.
+
+    The role lives here rather than on TeamMember because it is a fact about a
+    person *in a team*, not about the person. Someone can lead next year's
+    cohort while still being an ordinary member of this one -- which the batch
+    field could never express.
+    """
+
+    team = models.ForeignKey(Team, on_delete=models.CASCADE, related_name="memberships")
+    member = models.ForeignKey(
+        TeamMember, on_delete=models.CASCADE, related_name="memberships"
+    )
+    role = models.CharField(
+        max_length=8, choices=TeamRole.choices, default=TeamRole.MEMBER,
+        db_index=True,
+    )
+    joined_at = models.DateTimeField(default=timezone.now)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "team_memberships"
+        ordering = ["team", "member"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["team", "member"], name="uniq_team_member"
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.member.name} — {self.role} of {self.team.name}"
+
+
 class GmailCredential(TimeStampedModel):
     """A member's authorisation for this server to send mail as them.
 
@@ -408,6 +498,13 @@ class Campaign(TimeStampedModel):
     )
     created_by = models.ForeignKey(
         TeamMember, on_delete=models.SET_NULL, null=True, related_name="campaigns"
+    )
+
+    #: Which team's campaign this is. Only meaningful on a root; a sub-campaign
+    #: inherits it. Nullable because campaigns predate teams.
+    team = models.ForeignKey(
+        "Team", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="campaigns",
     )
 
     #: NULL for a root campaign. PROTECT because deleting a root out from under

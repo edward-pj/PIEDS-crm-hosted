@@ -110,6 +110,10 @@ TERMINAL_SCHEDULE_STATUSES = frozenset({
     ScheduleStatus.FAILED.value,
 })
 
-#: The batch that may access the assignment UI. Single source of truth for the
-#: permission rule -- never inline this literal anywhere else.
-LEAD_BATCH = "2024"
+# NOTE: `LEAD_BATCH = "2024"` used to live here and was the entire permission
+# system. It is gone. A lead is now someone with the `lead` role on an active
+# team -- see crm/models.py::TeamMembership and services/permissions.py::is_lead.
+#
+# Left as a comment rather than deleted silently: a literal that decided who
+# could touch the contact pool is worth a headstone, and anyone grepping for it
+# after reading an old commit should land here rather than on nothing.

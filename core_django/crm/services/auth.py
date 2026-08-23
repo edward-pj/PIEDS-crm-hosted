@@ -44,6 +44,23 @@ class GoogleAuthError(RuntimeError):
     """Raised with a message that is safe to show the person signing in."""
 
 
+class UnknownMember(GoogleAuthError):
+    """A verified BITS account with no TeamMember yet.
+
+    Deliberately NOT a refusal. It carries the proven identity forward to the
+    join screen, so the code is the only thing still to establish -- the address
+    has already been verified against Google's signed token and the `hd` claim,
+    and asking for it again would invite typing a different one.
+    """
+
+    def __init__(self, email: str, display_name: str = ""):
+        self.email = email
+        self.display_name = display_name
+        super().__init__(
+            f"{email} is not on a team yet. Enter your team's join code to continue."
+        )
+
+
 # --- session ---------------------------------------------------------------
 
 
@@ -135,9 +152,12 @@ def google_authorization_url(request) -> str:
 def member_from_google_callback(request) -> TeamMember:
     """Exchange the code, verify the token, and map it to a TeamMember.
 
-    Every failure here is a refusal to sign anyone in. There is no path that
-    creates a member -- a person who is not already in the pool has no business
-    holding a session, and adding them is a lead's decision.
+    Every failure here is a refusal to sign anyone in, with ONE exception: a
+    verified address on the hosted domain that has no member row raises
+    `UnknownMember`, which the view turns into the join-code screen rather than
+    a dead end. Membership is still not automatic -- a code is required -- but
+    it no longer needs a lead at a keyboard for each person, which is what the
+    deleted name-picker door used to (badly) provide.
     """
     from google.auth.transport import requests as google_requests
     from google.oauth2 import id_token as google_id_token
@@ -174,7 +194,9 @@ def member_from_google_callback(request) -> TeamMember:
     email = claims["email"].lower()
     member = TeamMember.objects.filter(bits_email__iexact=email, is_active=True).first()
     if member is None:
-        raise GoogleAuthError(
-            f"{email} is not an active team member. Ask a lead to add you first."
-        )
+        # A verified BITS address with no member row is a new joiner, not an
+        # intruder -- the `hd` check above is what makes that safe to say, and
+        # it is the thing standing between a personal Gmail and the pool.
+        # They are sent to /join/, where a valid code creates the member.
+        raise UnknownMember(email, claims.get("name") or "")
     return member

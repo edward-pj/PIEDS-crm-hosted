@@ -1,0 +1,51 @@
+{% load static %}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Join a team — Ignite CRM</title>
+  <link rel="stylesheet" href="{% static 'basecoat/basecoat.css' %}">
+  <link rel="stylesheet" href="{% static 'basecoat/app.css' %}">
+  <script>
+    if (localStorage.theme === 'dark' ||
+        (!('theme' in localStorage) && matchMedia('(prefers-color-scheme: dark)').matches)) {
+      document.documentElement.classList.add('dark');
+    }
+  </script>
+</head>
+<body>
+<div style="display:grid;place-items:center;min-height:100vh;padding:1.5rem">
+  <div class="card" style="width:100%;max-width:24rem">
+    <header>
+      <h2>Join your team</h2>
+      <p class="muted text-sm">
+        Signed in as <strong>{{ email }}</strong>. Enter the code your lead gave you.
+      </p>
+    </header>
+
+    <section class="col" style="gap:1.25rem">
+      {% for message in messages %}
+        <div class="alert alert-destructive"><section><p>{{ message }}</p></section></div>
+      {% endfor %}
+
+      <form method="post" class="col" style="gap:.75rem">
+        {% csrf_token %}
+        <label class="label" for="code">Join code</label>
+        {# autocapitalize because the codes are upper-case and phones are not. #}
+        <input class="input" type="text" name="code" id="code" required autofocus
+               autocomplete="off" autocapitalize="characters" spellcheck="false"
+               placeholder="e.g. K7PQ2M9XRT">
+        <button type="submit" class="btn" style="width:100%;justify-content:center">
+          Join
+        </button>
+      </form>
+
+      <p class="muted text-sm">
+        No code? Ask a team lead — they can read it off the team page, or issue
+        a new one.
+      </p>
+    </section>
+  </div>
+</div>
+</body>
+</html>

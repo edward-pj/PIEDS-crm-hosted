@@ -1,9 +1,17 @@
 # Ignite CRM — PIEDS Mass Mailing System
 
 A shared contact pool and mass-mailing system for PIEDS, BITS Pilani's technology
-business incubator. One master database, a hosted CRM the 2024 batch runs, and a
-small app each 2025-batch member runs on their own laptop to send from their own
-Gmail.
+business incubator. One hosted CRM on one URL: a member signs in with their BITS
+Google account, connects Gmail once, and sees the contacts they personally have
+to mail — already assigned, already deduplicated, with their own footer on the
+team's shared message. Mail leaves their real mailbox, so replies come back to
+them and nothing is delivered as a bulk sender.
+
+> **Being migrated from a two-process design.** Until recently this was a hosted
+> CRM plus `local_agent/`, a FastAPI app each member ran on their own laptop to
+> hold their Gmail credentials. Sending has moved server-side and the agent is
+> being retired; sections still describing it are marked where they are now
+> historical.
 
 ---
 
@@ -114,7 +122,7 @@ gap. Nobody receives "Hi , we loved what you're building at ."
 
 ### 3.5 Nobody edits data they don't own
 
-2025-batch members can only change contacts assigned to them. Enforced per-object
+Ordinary members can only change contacts assigned to them. Enforced per-object
 in `services/permissions.py` and again in `services/contacts.py` — twice, because
 the API accepts JSON, and JSON does not respect a form's field list.
 
@@ -122,12 +130,37 @@ the API accepts JSON, and JSON does not respect a form's field list.
 
 ## 4. Who can do what
 
-Defined once, in `shared/enums.py::LEAD_BATCH` (currently `"2024"`) and
-`services/permissions.py`. Changing which batch leads next year is a one-line edit.
+A **lead** is someone with the `lead` role on an active team
+(`crm/models.py::TeamMembership`), read in exactly one place:
+`services/permissions.py::is_lead`.
 
-| | batch 2024 (lead) | batch 2025 |
+It used to be `member.batch == "2024"`, a literal in `shared/enums.py` that had
+to be edited every year, could not express "lead of this team but not that one",
+and made the permission system a fact about when somebody was admitted to
+university. **`TeamMember.batch` is now a display field and grants nothing.**
+
+`is_lead(member)` keeps its one-argument signature deliberately — it answers "is
+this person a lead of anything", which is the right question for the ~22
+decorator call sites and the contact-level rules, so none of them changed when
+the rule underneath did. Questions genuinely about one team get their own
+function, `assignable_members(actor)`, rather than a second argument every
+caller would have to start passing.
+
+Two details that are deliberate rather than incidental:
+
+- **A lead of a *deactivated* team keeps nothing.** `is_lead` filters on
+  `team__is_active=True`, so last year's leads do not hold the contact pool
+  forever.
+- **The answer is cached on the resolved member instance**, not globally.
+  `lead_required` calls `is_lead` on every guarded request and `_base` calls it
+  again for the template context, so without the cache every page costs two
+  extra queries. Per-instance means it dies with the request — a role change
+  takes effect on the member's next page load.
+
+| | lead | member |
 |---|---|---|
-| **Signs in by** | **picking their name** | **Google, BITS domain only** |
+| **Signs in by** | **Google, BITS domain only** | **Google, BITS domain only** |
+| **Becomes one by** | being promoted by another lead | a team join code |
 | See the whole pool | ✅ | ✅ |
 | Edit a contact | anyone's | **only their own assigned** |
 | Archive / restore | anyone's | only their own |
@@ -170,11 +203,20 @@ as any lead. `test_login.py::TestTheNameDoorIsGone` is the tripwire: it asserts
 the route does not resolve, that `POST /login/name/` is a 404, and that no member
 UUID appears anywhere in the login page. If any of those fail, the hole is back.
 
-**Adding a new person** is a lead's job through `/admin/` until join codes land.
-There is no self-service door and no fallback if Google is misconfigured — the
-login page says so rather than degrading to something weaker.
+**Adding a new person is a join code.** A lead reads the code out; the new joiner
+signs in with their BITS Google account and enters it. Both halves are required
+and neither is sufficient: **Google decides *who*, the code decides *which
+team*.** There is deliberately no field to type an address into on `/join/` —
+that would be a field an attacker could type into — so the address is always the
+one Google signed, carried through the session.
 
-**Why 2025 members can edit at all.** They are the ones actually in conversation
+Codes are 10 characters from a 28-symbol alphabet (~48 bits) that omits O/0,
+I/1/L and U/V, because a code dictated across a room and typed back wrong is a
+support request. `/join/` allows 10 attempts per session; a lead can issue a new
+code from the team page at any time and the old one dies immediately, which is
+the answer to a code that has been overheard or screenshotted.
+
+**Why members can edit contacts at all.** They are the ones actually in conversation
 with their prospects, so they are the first to learn that a designation changed
 or a name was misspelt. Making them file a request to a lead guarantees the pool
 stays wrong. Scoping it to their own list means a stale row in someone else's
@@ -833,8 +875,9 @@ cd core_django
 ../.venv/bin/python manage.py createsuperuser   # optional, for /admin/ only
 ```
 
-`seed_dev` creates four members — `aarav`, `diya` (batch 2024, leads) and
-`kabir`, `ishita` (batch 2025) — plus ~50 contacts with assorted tags and
+`seed_dev` creates one team (`PIEDS Outreach`, join code `DEVCODE123`) and four
+members on it — `aarav`, `diya` (leads) and `kabir`, `ishita` (members) — plus
+~50 contacts with assorted tags and
 lifecycles, and one active campaign. The two leads can sign in immediately by
 picking their name; the 2025 members need Google configured (§15.1).
 
@@ -1049,7 +1092,7 @@ mixing them up is the most likely thing to go wrong here:
 | `client_secret.json` | **Desktop app** | `local_agent` | sending mail as the member |
 | `GOOGLE_OAUTH_CLIENT_ID/SECRET` | **Web application** | `core_django` | batch-2025 sign-in |
 
-### 15.1 Web client — sign-in for batch 2025
+### 15.1 Web client — sign-in, for everyone
 
 1. **Credentials → Create OAuth client ID → Web application**.
 2. Authorised redirect URI, exactly:

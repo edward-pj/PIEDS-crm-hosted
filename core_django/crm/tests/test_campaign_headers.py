@@ -22,6 +22,8 @@ from crm.services.render import render
 from crm.services.richtext import to_html, to_plain, validate_markup
 from shared.enums import CampaignStatus
 
+from .conftest import make_lead
+
 pytestmark = pytest.mark.django_db
 
 
@@ -95,10 +97,8 @@ def test_non_ascii_sender_name_is_encoded_not_dropped():
     assert "k@x.com" in message.as_string()
 
 
-def test_lead_can_set_a_sender_name(client, member):
-    lead = TeamMember.objects.create(
-        name="Aarav", bits_email="aarav@pilani.bits-pilani.ac.in", batch="2024"
-    )
+def test_lead_can_set_a_sender_name(client, member, team):
+    lead = make_lead(team)
     session = client.session
     session["member_id"] = str(lead.id)
     session.save()
