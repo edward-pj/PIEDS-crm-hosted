@@ -1106,7 +1106,7 @@ ignite: tests pinned to localhost:5432/ignite_crm (never the hosted database)
 ```
 
 Verified by running the suite with `DATABASE_URL` pointed at a fake Supabase
-host: all 290 tests still pass against localhost.
+host: all 304 tests still pass against localhost.
 
 ---
 
@@ -1277,7 +1277,7 @@ designed but not deployed; see `docs/MAIL_SCHEDULING.md`. The ping interval is a
 .venv/bin/python -m pytest          # needs docker compose up
 ```
 
-**290 tests**, all passing:
+**304 tests**, all passing:
 
 | File | Count | Covers |
 |---|---|---|
@@ -1293,6 +1293,7 @@ designed but not deployed; see `docs/MAIL_SCHEDULING.md`. The ping interval is a
 | `test_constraints.py` | 16 | both unique constraints, `NOT NULL`, status transitions |
 | `test_login.py` | 11 | the one door, and that the deleted one stays deleted (§4.1) |
 | `test_send_recovery.py` | 9 | the 19 Aug incident: chunking, retry, no double-send |
+| `test_bootstrap.py` | 14 | `bootstrap_team` — the first team, and every re-run of it |
 
 `test_mailing.py` used to be `test_mailing_api.py`, driven through the token API
 the laptop agent spoke. Only the tests genuinely *about* the API — bearer-token
@@ -1379,12 +1380,48 @@ Gitignored and never committed: `.env`.
 ```bash
 cd core_django
 
+../.venv/bin/python manage.py bootstrap_team you@pilani.bits-pilani.ac.in \
+    --team "Ignite 26" --name "Your Name"  # the first team and its first lead
 ../.venv/bin/python manage.py check_db     # verify the live DB is safe to send from
-../.venv/bin/python manage.py seed_dev     # dev fixtures (team + join code)
 ../.venv/bin/python manage.py run_tick     # drain the queued sends once
+../.venv/bin/python manage.py stranded_drafts   # list, and optionally settle, half-sent mail
+../.venv/bin/python manage.py seed_dev     # dev fixtures (team + join code) — local only
 ../.venv/bin/python manage.py migrate
 ../.venv/bin/python manage.py makemigrations
 ```
+
+### `bootstrap_team` — the one a fresh deployment cannot skip
+
+Signing in requires a `TeamMember`; becoming one requires a join code; a join
+code requires a `Team`. **Nothing in the app creates the first link in that
+chain**, so a correctly deployed CRM with an empty database has no way for
+anyone — including you — to get in.
+
+That is deliberate rather than an oversight. A migration that invented a team
+would have to invent a join code nobody could ever be told;
+`0014_seed_default_team` writes the literal `ROTATE-ME` in plain sight for
+exactly that reason, and only for databases that already had members.
+
+**Render's free plan has no shell**, so run this from your own machine with
+`DATABASE_URL` pointed at Supabase. It is reachable from anywhere; that is the
+whole point of it being the master, and nothing else about your local setup has
+to be working.
+
+```bash
+cd core_django
+DATABASE_URL="<supabase-session-pooler-url>" \
+  ../.venv/bin/python manage.py bootstrap_team you@pilani.bits-pilani.ac.in \
+      --team "Ignite 26" --name "Your Name" --self-contact
+```
+
+It prints a join code. Read it out; everyone else joins through `/join/` in a
+browser and never touches a command line. `--self-contact` also creates a
+prospect who is *you*, so the first live send lands in your own inbox.
+
+Re-running is safe and expected: the team and the member are updated rather than
+duplicated, an existing member is promoted to lead rather than refused, and a
+join code people are already using is **not** rotated silently — pass
+`--rotate-code`, or use the Team page.
 
 `check_db` asserts the indexes, the hierarchy invariants and the token key,
 that `SELECT … FOR UPDATE` actually works over this connection, and that you are
@@ -1445,10 +1482,11 @@ ignite_crm/
 │       │     sending.py           claim → send → record, chunked
 │       │     runner.py            one pass over everything due
 │       │     teams.py             join codes, roles
-│       ├── management/commands/   check_db.py, seed_dev.py, run_tick.py
+│       ├── management/commands/   bootstrap_team.py, check_db.py, run_tick.py,
+│       │                          seed_dev.py, stranded_drafts.py
 │       ├── migrations/            0001 … 0015_revoke_api_tokens
-│       ├── templates/crm/         19 templates
-│       └── tests/                 290 tests, incl. conftest.py
+│       ├── templates/crm/         22 templates
+│       └── tests/                 304 tests, incl. conftest.py
 │
 └── render.yaml                    the hosting blueprint
 ```
