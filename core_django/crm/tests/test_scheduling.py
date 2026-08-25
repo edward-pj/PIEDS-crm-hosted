@@ -9,15 +9,24 @@ Nothing here sleeps. Every timing rule takes `now` as a parameter precisely so
 a six-hour grace window is a six-line test.
 """
 
-import json
 from datetime import timedelta
 
 import pytest
 from django.urls import reverse
 from django.utils import timezone
 
-from crm.models import ApiToken, Campaign, CampaignMailing, Contact, ScheduledSend, TeamMember
+from crm.models import (
+    Campaign,
+    CampaignMailing,
+    Contact,
+    GmailCredential,
+    ScheduledSend,
+    TeamMember,
+)
+from crm.services import gmail as gmail_svc
+from crm.services import runner
 from crm.services import scheduling as svc
+from crm.services import secrets as token_store
 from shared.enums import CampaignStatus, ContactLifecycle, MailingStatus, ScheduleStatus
 
 from .conftest import make_lead
@@ -62,12 +71,6 @@ def other_member():
     return TeamMember.objects.create(
         name="Ishita", bits_email="ishita@pilani.bits-pilani.ac.in", batch="2025"
     )
-
-
-@pytest.fixture
-def auth(member):
-    _, raw = ApiToken.issue(member, "test laptop")
-    return {"HTTP_AUTHORIZATION": f"Token {raw}"}
 
 
 @pytest.fixture
@@ -389,51 +392,115 @@ def test_a_running_job_must_be_cancelled_not_rescheduled(campaign, member, conta
         svc.reschedule(job.id, timezone.now() + timedelta(days=1), member=member)
 
 
-# ----------------------------------------------------------------------- API
-
-def _post(client, url, payload, auth):
-    return client.post(url, data=json.dumps(payload), content_type="application/json", **auth)
-
-
-def test_api_creates_and_lists_a_schedule(client, auth, campaign, contact, member):
-    when = (timezone.now() + timedelta(hours=2)).isoformat()
-    r = _post(client, reverse("api:schedules"),
-              {"campaign_id": str(campaign.id), "contact_ids": [str(contact.id)],
-               "scheduled_at": when, "cc": "lead@x.com"}, auth)
-    assert r.status_code == 201, r.content
-    assert r.json()["cc"] == "lead@x.com"
-
-    listed = client.get(reverse("api:schedules"), **auth).json()
-    assert len(listed) == 1 and listed[0]["total"] == 1
+# ------------------------------------------------- the runner, end to end
+# These replace a block of tests that drove the same code through the token API
+# the laptop agent used. The API is gone with the agent; the behaviour it
+# exercised -- lease, send, advance the cursor, finish -- is not, and now runs
+# in-process through services/runner.py. Testing it there is closer to what
+# actually happens.
 
 
-def test_api_rejects_a_malformed_time(client, auth, campaign, contact):
-    r = _post(client, reverse("api:schedules"),
-              {"campaign_id": str(campaign.id), "contact_ids": [str(contact.id)],
-               "scheduled_at": "next tuesday"}, auth)
-    assert r.status_code == 400
-    assert "ISO 8601" in r.json()["error"]
+class _FakeGmail:
+    def __init__(self):
+        self.sent = []
+
+    def verify_identity(self):
+        return "ok"
+
+    def send(self, *, to, subject, body, body_html="", from_name="", cc="", bcc=""):
+        self.sent.append(to)
+        return gmail_svc.SendResult(
+            message_id=f"m{len(self.sent)}", thread_id=f"t{len(self.sent)}"
+        )
+
+    def find_message_to(self, address, subject):
+        return None
 
 
-def test_api_claim_returns_the_slice_to_send(client, auth, campaign, member):
-    contacts = [make_contact(member, i) for i in range(3)]
-    schedule(campaign, member, contacts, when=due_now())
+@pytest.fixture
+def connected(member):
+    """A member the server can actually send as."""
+    ciphertext, version = token_store.encrypt("refresh")
+    GmailCredential.objects.create(
+        member=member, google_email=member.bits_email,
+        refresh_token_encrypted=ciphertext, key_version=version,
+        granted_scopes=list(gmail_svc.SCOPES),
+        identity_verified_at=timezone.now(),
+    )
+    return member
 
-    body = _post(client, reverse("api:schedule_claim"), {"agent_id": "docker"}, auth).json()
-    assert len(body["claimed"]) == 1
-    assert body["claimed"][0]["contact_ids"] == [str(c.id) for c in contacts]
+
+def test_a_due_job_is_leased_sent_and_finished(campaign, connected, contact):
+    job = schedule(campaign, connected, [contact], when=due_now())
+    gmail = _FakeGmail()
+
+    report = runner.tick(gmail_for=lambda m: gmail)
+
+    assert report.sent == 1
+    assert gmail.sent == [contact.email]
+    job.refresh_from_db()
+    assert job.status == ScheduleStatus.DONE.value
+    assert job.cursor == job.total
 
 
-def test_api_progress_and_cancel_round_trip(client, auth, campaign, member, contact):
-    job = schedule(campaign, member, [contact], when=due_now())
-    _post(client, reverse("api:schedule_claim"), {}, auth)
+def test_a_job_that_is_not_due_is_left_alone(campaign, connected, contact):
+    job = schedule(campaign, connected, [contact],
+                   when=timezone.now() + timedelta(hours=3))
 
-    out = _post(client, reverse("api:schedule_progress", args=[job.id]),
-                {"attempted": 1, "sent": 1, "skipped": 0}, auth).json()
-    assert out["status"] == ScheduleStatus.DONE.value
+    report = runner.tick(gmail_for=lambda m: _FakeGmail())
 
-    r = _post(client, reverse("api:schedule_cancel", args=[job.id]), {}, auth)
-    assert r.status_code == 400   # already done; nothing left to call off
+    assert report.sent == 0
+    job.refresh_from_db()
+    assert job.status == ScheduleStatus.PENDING.value
+    assert job.attempts == 0
+
+
+def test_a_paused_campaign_holds_the_job_rather_than_sending_it(
+    campaign, connected, contact
+):
+    """Pausing is the documented emergency brake. It has to stop a send that was
+    queued before someone pulled it."""
+    job = schedule(campaign, connected, [contact], when=due_now())
+    campaign.status = CampaignStatus.PAUSED.value
+    campaign.save()
+
+    gmail = _FakeGmail()
+    runner.tick(gmail_for=lambda m: gmail)
+
+    assert gmail.sent == []
+    job.refresh_from_db()
+    assert job.status == ScheduleStatus.HELD.value
+    assert "paused" in job.last_error
+
+
+def test_a_drip_sends_one_batch_per_tick(campaign, connected):
+    contacts = [make_contact(connected, i) for i in range(4)]
+    job = schedule(campaign, connected, contacts, when=due_now(),
+                   batch_size=2, interval_minutes=30)
+
+    gmail = _FakeGmail()
+    runner.tick(gmail_for=lambda m: gmail)
+
+    assert len(gmail.sent) == 2
+    job.refresh_from_db()
+    assert job.cursor == 2
+    assert job.status == ScheduleStatus.PENDING.value
+
+
+def test_the_cursor_advances_past_contacts_that_were_skipped(campaign, connected):
+    """Otherwise a permanently unmailable contact stalls the job forever."""
+    good = make_contact(connected, 1)
+    blocked = make_contact(connected, 2)
+    blocked.lifecycle = ContactLifecycle.DO_NOT_CONTACT.value
+    blocked.save()
+
+    job = schedule(campaign, connected, [blocked, good], when=due_now())
+    runner.tick(gmail_for=lambda m: _FakeGmail())
+
+    job.refresh_from_db()
+    assert job.status == ScheduleStatus.DONE.value
+    assert job.sent_count == 1
+    assert job.skipped_count == 1
 
 
 # ------------------------------------------------------- the CRM schedule page

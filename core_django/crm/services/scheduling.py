@@ -18,6 +18,7 @@ actually waiting six hours.
 from datetime import timedelta
 
 from django.conf import settings
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
@@ -76,7 +77,7 @@ def create(*, campaign_id, member, contact_ids, scheduled_at, cc="", bcc="",
 
     try:
         campaign = Campaign.objects.get(id=campaign_id)
-    except (Campaign.DoesNotExist, ValueError, TypeError):
+    except (Campaign.DoesNotExist, DjangoValidationError, ValueError, TypeError):
         raise NotSchedulable("No such campaign.")
 
     # Checked now for a clear error, and AGAIN at execution: a campaign paused
@@ -392,7 +393,7 @@ def record_progress(job_id, member, *, attempted, sent, skipped, error="", now=N
         job = ScheduledSend.objects.select_for_update().select_related("campaign").get(
             id=job_id, member=member
         )
-    except (ScheduledSend.DoesNotExist, ValueError, TypeError):
+    except (ScheduledSend.DoesNotExist, DjangoValidationError, ValueError, TypeError):
         return {"status": "unknown", "detail": "no such scheduled send"}
 
     # A human cancelled it while the batch was in flight. Honour that and stop.
@@ -455,7 +456,7 @@ def cancel(job_id, *, member=None, actor=None) -> ScheduledSend:
         qs = qs.filter(member=member)
     try:
         job = qs.get(id=job_id)
-    except (ScheduledSend.DoesNotExist, ValueError, TypeError):
+    except (ScheduledSend.DoesNotExist, DjangoValidationError, ValueError, TypeError):
         raise NotSchedulable("No such scheduled send.")
 
     if job.status in TERMINAL_SCHEDULE_STATUSES:
@@ -480,7 +481,7 @@ def reschedule(job_id, new_time, *, member=None, now=None) -> ScheduledSend:
         qs = qs.filter(member=member)
     try:
         job = qs.get(id=job_id)
-    except (ScheduledSend.DoesNotExist, ValueError, TypeError):
+    except (ScheduledSend.DoesNotExist, DjangoValidationError, ValueError, TypeError):
         raise NotSchedulable("No such scheduled send.")
 
     if job.status in TERMINAL_SCHEDULE_STATUSES:

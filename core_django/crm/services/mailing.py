@@ -115,7 +115,7 @@ class Claimed:
 def load_sendable_campaign(campaign_id) -> Campaign:
     try:
         campaign = Campaign.objects.select_related("parent").get(id=campaign_id)
-    except (Campaign.DoesNotExist, ValueError, TypeError):
+    except (Campaign.DoesNotExist, DjangoValidationError, ValueError, TypeError):
         raise CampaignNotSendable(f"No campaign {campaign_id}")
 
     # Both the sub-campaign AND its root must be active. Checking only the
@@ -401,7 +401,7 @@ def record_result(mailing_id, member, *, status, message_id="", thread_id="", er
     """Record what the agent's Gmail call actually did."""
     try:
         mailing = CampaignMailing.objects.select_for_update().get(id=mailing_id)
-    except (CampaignMailing.DoesNotExist, ValueError, TypeError):
+    except (CampaignMailing.DoesNotExist, DjangoValidationError, ValueError, TypeError):
         return {"status": FAILED, "detail": "no such mailing"}
 
     if mailing.sent_by_id != member.id:

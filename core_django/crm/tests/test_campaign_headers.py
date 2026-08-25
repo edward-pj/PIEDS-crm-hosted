@@ -8,7 +8,6 @@ validated before any row is written, so a typo cannot leave half a batch
 claimed with the copy silently dropped.
 """
 
-import json
 from email.message import EmailMessage
 from email.utils import formataddr
 
@@ -16,7 +15,7 @@ import pytest
 from django.urls import reverse
 
 from crm.forms import CampaignForm
-from crm.models import ApiToken, Campaign, CampaignMailing, Contact, TeamMember
+from crm.models import Campaign, CampaignMailing, Contact, TeamMember
 from crm.services import mailing as mailing_svc
 from crm.services.render import render
 from crm.services.richtext import to_html, to_plain, validate_markup
@@ -32,12 +31,6 @@ def member():
     return TeamMember.objects.create(
         name="Kabir Rao", bits_email="kabir@pilani.bits-pilani.ac.in", batch="2025"
     )
-
-
-@pytest.fixture
-def auth(member):
-    _, raw = ApiToken.issue(member, "test laptop")
-    return {"HTTP_AUTHORIZATION": f"Token {raw}"}
 
 
 @pytest.fixture
@@ -151,39 +144,27 @@ def test_bad_cc_claims_nothing(campaign, contact, member):
     assert not CampaignMailing.objects.filter(contact=contact).exists()
 
 
-def test_api_rejects_a_bad_cc_with_a_readable_error(client, auth, campaign, contact):
-    response = client.post(
-        reverse("api:claim"),
-        data=json.dumps({
-            "campaign_id": str(campaign.id),
-            "contact_ids": [str(contact.id)],
-            "cc": "not-an-email",
-        }),
-        content_type="application/json",
-        **auth,
-    )
-    assert response.status_code == 400
-    assert "not a valid email" in response.json()["error"]
+def test_a_bad_cc_is_refused_with_a_readable_error(campaign, contact, member):
+    """The message reaches a person, so it has to say what is wrong with it."""
+    with pytest.raises(mailing_svc.InvalidCopyAddresses) as exc:
+        mailing_svc.claim_batch(campaign, member, [contact.id], cc="not-an-email")
+
+    assert "not a valid email" in str(exc.value)
 
 
-def test_preflight_echoes_the_copies_back(client, auth, campaign, contact, member):
+def test_the_envelope_is_normalised_before_it_is_stored(campaign, contact, member):
+    """Whitespace in, clean address out -- and the sender name resolved from the
+    member, not from whatever the caller claimed."""
     member.sender_name = "Kabir from PIEDS"
     member.save()
 
-    response = client.post(
-        reverse("api:preflight"),
-        data=json.dumps({
-            "campaign_id": str(campaign.id),
-            "contact_ids": [str(contact.id)],
-            "cc": " lead@x.com ",
-        }),
-        content_type="application/json",
-        **auth,
+    claimed, _ = mailing_svc.claim_batch(
+        campaign, member, [contact.id], cc=" lead@x.com "
     )
-    body = response.json()
-    assert body["cc"] == "lead@x.com"
-    assert body["bcc"] == ""
-    assert body["from_name"] == "Kabir from PIEDS"
+
+    assert claimed[0].cc == "lead@x.com"
+    assert claimed[0].bcc == ""
+    assert claimed[0].from_name == "Kabir from PIEDS"
 
 
 # --------------------------------------------------------------- html body

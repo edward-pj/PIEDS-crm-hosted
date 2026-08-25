@@ -11,15 +11,15 @@ Plus the two states that must actually refuse mail rather than merely being
 hidden from a list.
 """
 
-import json
 
 import pytest
 from django.contrib.auth.models import User
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.urls import reverse
 
-from crm.models import ApiToken, Campaign, CampaignMailing, Contact, ContactAudit, TeamMember
+from crm.models import Campaign, CampaignMailing, Contact, ContactAudit, TeamMember
 from crm.services import auth as auth_svc
+from crm.services import permissions
 from crm.services import contacts as contact_svc
 from crm.services import mailing as mailing_svc
 from shared.enums import CampaignStatus, ContactLifecycle, MailingStatus
@@ -330,46 +330,33 @@ class TestWebViews:
         assert mine.email in shown
 
 
-class TestContactApi:
-    @pytest.fixture
-    def auth(self, member):
-        _, raw = ApiToken.issue(member, "laptop")
-        return {"HTTP_AUTHORIZATION": f"Token {raw}"}
+class TestEditPermissionsAtTheServiceLayer:
+    """These used to go through the token API, which the laptop agent used.
 
-    def test_agent_can_edit_its_own_contact(self, client, auth, mine):
-        r = client.patch(
-            reverse("api:contact_update", args=[mine.pk]),
-            data=json.dumps({"designation": "Founder", "tags": ["fintech"]}),
-            content_type="application/json",
-            **auth,
-        )
-        assert r.status_code == 200
+    The API is gone with the agent, but the RULES it exercised are not -- they
+    are enforced in services/contacts.py, which is where they always were. The
+    API tested them at one remove; these test them directly, which is if
+    anything a better place for them.
+    """
+
+    def test_a_member_can_edit_their_own_contact(self, member, mine):
+        contact_svc.update(mine, {"designation": "Founder", "tags": ["fintech"]}, member)
+
         mine.refresh_from_db()
         assert mine.designation == "Founder"
         assert mine.tags == ["fintech"]
 
-    def test_agent_cannot_edit_someone_elses(self, client, auth, theirs):
-        r = client.patch(
-            reverse("api:contact_update", args=[theirs.pk]),
-            data=json.dumps({"designation": "hijacked"}),
-            content_type="application/json",
-            **auth,
-        )
-        assert r.status_code == 403
+    def test_a_member_cannot_edit_someone_elses(self, member, theirs):
+        with pytest.raises(PermissionDenied):
+            contact_svc.update(theirs, {"designation": "hijacked"}, member)
+
         theirs.refresh_from_db()
         assert theirs.designation == "VP"
 
-    def test_agent_contact_list_excludes_archived(self, client, auth, member, mine):
+    def test_a_member_may_still_edit_a_contact_they_archived(self, member, mine):
+        """Archiving hides a contact from lists and refuses mail to them; it
+        does not hand ownership back. Un-archiving has to stay possible for the
+        person who did it -- see TestBlockedStatesRefuseMail for the half that
+        actually stops mail."""
         contact_svc.set_archived(mine, member, archived=True)
-        rows = client.get(reverse("api:contacts"), **auth).json()
-        assert rows == []
-
-    def test_contact_payload_carries_tags_and_lifecycle(self, client, auth, mine):
-        mine.tags = ["fintech"]
-        mine.save()
-        row = client.get(reverse("api:contacts"), **auth).json()[0]
-
-        assert row["tags"] == ["fintech"]
-        assert row["lifecycle"] == ContactLifecycle.NEW.value
-        assert row["first_name"] == "Rohan"      # needed to prefill the edit dialog
-        assert row["mailable"] is True
+        assert mine in permissions.editable_contacts(member)

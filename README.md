@@ -26,7 +26,7 @@ them and nothing is delivered as a bulk sender.
 7. [The send protocol](#7-the-send-protocol)
 8. [Staying in sync](#8-staying-in-sync)
 9. [Screens](#9-screens)
-10. [HTTP API](#10-http-api)
+10. [HTTP API — removed](#10-http-api--removed)
 11. [Services — where the rules live](#11-services--where-the-rules-live)
 12. [Setup](#12-setup)
 13. [Running it](#13-running-it)
@@ -45,46 +45,66 @@ them and nothing is delivered as a bulk sender.
 
 ## 1. What this is
 
-Two apps, one database, one visual language:
+One Django app, one database, one URL.
 
-- **`core_django/`** — the CRM. Owns the schema, the contact pool, campaigns,
-  assignment, and **every safety rule**. It is the only process that connects to
-  the database. **It never sends mail.**
-- **`local_agent/`** — a small FastAPI app each team member runs on their laptop.
-  Talks to the CRM over HTTPS and sends through *their own* Gmail. Holds no
-  database credentials.
+**`core_django/`** owns the schema, the contact pool, campaigns, assignment,
+every safety rule — and now the sending too. A member signs in with their BITS
+Google account, grants Gmail access once, and the server sends *as them* using a
+refresh token it holds encrypted.
 
-The split exists because of one asymmetry: **neither side can send mail alone.**
-The server knows who to mail and enforces every rule, but has no mailbox. The
-agent has a mailbox but doesn't know who to mail until the server hands it a
-claim. That is the whole security model.
+**Mail still leaves each member's own mailbox**, which was always the point and
+has not changed. A central sending address would land in spam at volume, and the
+person whose name is on the mail is the person who will get the reply.
 
 ---
 
 ## 2. Architecture
 
 ```
-   member's laptop                          hosted
-┌────────────────────────┐        ┌──────────────────────────┐
-│ local_agent (FastAPI)  │        │ core_django (Django)     │
-│ :8111                  │──────► │ :8000                    │──► Supabase
-│                        │ HTTPS  │                          │    Postgres
-│ holds: Gmail OAuth     │ +Token │ holds: DB credentials    │    (the master)
-│ holds: NO db creds     │        │ holds: NO Gmail creds    │
-└───────────┬────────────┘        └──────────────────────────┘
-            │
-            └──► Gmail API — the member's own mailbox, never the server's
+                                      hosted (Render, one service)
+   member's browser          ┌──────────────────────────────────┐
+   ─────────────────────────►│ core_django (Django + gunicorn)  │──► Supabase
+        Google sign-in       │                                  │    Postgres
+                             │ holds: DB credentials            │    (the master)
+                             │ holds: each member's Gmail       │
+                             │        refresh token, ENCRYPTED  │
+                             └──────────────┬───────────────────┘
+                                            │
+                                            └──► Gmail API, as the member
 ```
 
-**Why the agent is local at all.** Mail sent from a central server would come
-from one address and land in spam at volume. Each member sending from their own
-BITS address is both more deliverable and more honest — the person whose name is
-on the mail is the person who will get the reply.
+### What changed, and what it cost
 
-**Why the agent has no database access.** It used to. Moving the send logic
-server-side means the row lock, the unique constraint, and the DRAFT-before-send
-ordering all live next to the data they protect. Laptops stopped holding
-production credentials, and port 5432 never faces the internet.
+This used to be **two** processes: the CRM, plus `local_agent/` — a FastAPI app
+each member ran on their own laptop, holding their Gmail OAuth and no database
+credentials. The server deliberately held no Gmail credentials, so it *could not*
+impersonate anyone even if compromised.
+
+**That property was given up on purpose**, and it is the largest security
+decision in this repository. It is what makes the product work as one hosted URL:
+a member signs in, presses Send, and closes the tab. Scheduled sends fire whether
+or not anyone's laptop is on. The alternative was fifteen people each installing
+Python, obtaining a client secret, and running `uvicorn`.
+
+What replaces it, honestly stated:
+
+- Refresh tokens are **encrypted at rest** (`services/secrets.py`) with a key
+  that lives only in the hosting platform's environment, never in the database.
+  A database leak on its own therefore yields nothing usable. It is **not**
+  defence against an application compromise, and `secrets.py` says so.
+- `sent_by` stays trustworthy a different way: the granting Google account is
+  compared to the member's `bits_email` at grant time and re-verified against
+  Gmail's own `getProfile` after any credential change
+  (`gmail.py::verify_identity`).
+- A member can **revoke access from their own Google account page** at any time,
+  with no cooperation from us. The CRM then says "Gmail not connected" instead of
+  failing silently.
+- Every send still writes a durable `CampaignMailing` row naming the sender, and
+  every contact mutation still writes a `ContactAudit` row.
+
+**The database is still reached by exactly one process.** The row lock, the
+unique constraints and the DRAFT-before-send ordering all live next to the data
+they protect, and port 5432 never faces the internet.
 
 ---
 
@@ -104,9 +124,10 @@ Verify it exists on any host with `manage.py check_db`.
 
 ### 3.2 A sent mail always has a record
 
-The DRAFT row is committed **before** the agent is told to send. A crash can
+The DRAFT row is committed **before** the Gmail call is made. A crash can
 therefore leave an ambiguous DRAFT — visible and resolvable — but never a sent
-mail with no record, which would be unrecoverable.
+mail with no record, which would be unrecoverable. The ordering survived the
+move server-side unchanged; see §7.
 
 ### 3.3 `sent_by` is trustworthy
 
@@ -169,19 +190,25 @@ Two details that are deliberate rather than incidental:
 | Delete permanently | ✅ (never-mailed only) | ❌ |
 | Set `lifecycle` by hand | ✅ | ❌ — the server moves it |
 | Assign contacts to members | ✅ | ❌ |
-| Create / edit campaigns | ✅ | ❌ (read-only) |
-| Issue and revoke API tokens | ✅ | ❌ |
+| Create / edit a campaign body | ✅ | ❌ (read-only) |
+| Edit their own footer | ✅ | ✅ — the only campaign field a member owns |
+| Create a team, rotate its join code | ✅ | ❌ |
+| Change someone's role, remove them | ✅ | ❌ |
+| Distribute the pool across a team | ✅ | ❌ |
 | Import CSV | ✅ | ❌ |
+| Drain the send queue (§13.3) | ✅ | ❌ |
+| Connect their own Gmail | ✅ | ✅ |
 | Send mail | ✅ | ✅ |
 
-Both batches edit from **either surface**: full forms in the Django CRM, and an
-inline row editor in the local agent for fixing a detail just before sending.
+Everyone edits through the same screens. There is one surface now — the hosted
+CRM — so "which of the two apps am I looking at" is no longer a question anyone
+has to answer.
 
-### 4.1 Two doors, one per batch
+### 4.1 One door
 
-There is no password anywhere in the CRM. `services/auth.py` holds both doors,
-and identity is a session key holding a `TeamMember` id — Django's `User` model
-is consulted only by `/admin/`.
+There is no password anywhere in the CRM. `services/auth.py` holds the only
+door, and identity is a session key holding a `TeamMember` id — Django's `User`
+model is consulted only by `/admin/`.
 
 **Everyone signs in with Google**, restricted to the BITS hosted domain and
 matched against `TeamMember.bits_email`. The check is on Google's signed
@@ -238,22 +265,56 @@ leaks nothing about pool size.
 | `phone` | Char(10) | regex-validated, optional |
 | `linkedin` | URL | optional |
 | `sender_name` | Char(120) | what recipients see in the From line; blank falls back to `name` |
-| `batch` | Char(4) | **indexed — drives all permissions** |
+| `batch` | Char(4) | indexed; **display only** — permissions come from `team_memberships` |
 | `is_active` | Bool | |
-| `user` | OneToOne → Django `User` | `SET_NULL`; null for members who only run the agent |
+| `user` | OneToOne → Django `User` | `SET_NULL`; null for everyone who never touches `/admin/` |
 
-### `api_tokens`
+### `teams`
 | Field | Type | Notes |
 |---|---|---|
-| `member` | FK → TeamMember | `CASCADE` |
-| `label` | Char(80) | e.g. "Aarav's MacBook" |
-| `key_hash` | Char(64) | unique, indexed — **SHA-256 only** |
-| `key_prefix` | Char(8) | first chars, shown in the UI for identification |
-| `last_used_at` | DateTime | stamped on every request, so leads can spot stale tokens |
-| `revoked_at` | DateTime | |
+| `name` | Char(120) | |
+| `join_code` | Char(32) | unique, indexed — 10 chars generated, rotatable, see §4.1 |
+| `default_footer` | Text | seeds a member's footer when their sub-campaign is created |
+| `is_active` | Bool | a deactivated team's leads keep nothing (§4) |
+| `created_by` | FK → TeamMember | `SET_NULL` |
 
-The plaintext key is shown **once** at creation and is unrecoverable. A dumped
-database yields zero working credentials.
+### `team_memberships`
+| Field | Type | Notes |
+|---|---|---|
+| `team` / `member` | FK / FK | `CASCADE`; **`UNIQUE(team, member)`** |
+| `role` | Char(16) | `lead` or `member` — the entire permission system |
+| `joined_at` | DateTime | |
+| `is_active` | Bool | removal deactivates rather than deletes, so the audit trail survives |
+
+### `gmail_credentials`
+One row per member, `OneToOne → TeamMember`. This is what replaced the laptop
+agent's `token.json`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `refresh_token_encrypted` | Binary | Fernet, key from `GMAIL_TOKEN_KEY` |
+| `access_token_encrypted` / `access_token_expires_at` | Binary / DateTime | cached, or every mail costs an extra round trip to Google |
+| `key_version` | SmallInt | which `GMAIL_TOKEN_KEY` encrypted this row — makes rotation resumable |
+| `granted_scopes` | JSON list | what Google *actually* granted; a member can untick a scope |
+| `google_email` | Email | must match `bits_email`; the grant is refused otherwise |
+| `granted_at` / `last_refreshed_at` | DateTime | |
+| `identity_verified_at` | DateTime | cleared on reconnect; forces one `getProfile` before the next send |
+| `last_error` / `revoked_at` | Text / DateTime | what the "Gmail not connected" banner reads |
+
+**Be exact about what the encryption buys.** The key lives in the same
+environment as the app, so an application compromise yields every token
+regardless of it. It protects against **database disclosure only** — a leaked
+Supabase dump, a mis-scoped backup — which is a real threat and not the same as
+"tokens are safe".
+
+### `api_tokens`
+
+**Vestigial.** The table still exists; nothing reads it. It authenticated the
+laptop agent's HTTP API, which is gone (§10). Migration `0015` set `revoked_at`
+on every live row, so a token still sitting on somebody's laptop reaches nothing
+even if a route were reintroduced by accident. It is kept rather than dropped
+because a dropped table is the one migration with no cheap rollback; it goes in
+a later cleanup.
 
 ### `contacts`
 | Field | Type | Notes |
@@ -299,14 +360,16 @@ view cannot mutate a contact without leaving a trace.
 | `status` | Char(16) | indexed — `draft → active → paused → completed → archived` |
 | `created_by` | FK | |
 
-**Only `active` campaigns can be mailed.** Flipping one to `paused` in the CRM
-stops every agent on every laptop mid-batch. That is the emergency brake.
+**Only `active` campaigns can be mailed.** Flipping a *root* to `paused` stops
+every sub-campaign under it, mid-batch, for everyone. That is the emergency
+brake, and §5.0 explains why it has to be checked on the root as well as on the
+sub-campaign.
 
 ### `scheduled_sends` — mail queued for later
 
 | Field | Type | Notes |
 |---|---|---|
-| `campaign` / `member` | FK `PROTECT` | `member` is whose Gmail sends it — **and the only agent allowed to run it** |
+| `campaign` / `member` | FK `PROTECT` | `member` is whose Gmail sends it — and `claim_due` is per member, so nothing else can |
 | `contact_ids` | UUID array | snapshot of the selection |
 | `cursor` | int | index of the next contact to attempt |
 | `scheduled_at` | DateTime | indexed; the due query runs every 60s |
@@ -478,22 +541,24 @@ strips them anyway.
 **Sender name.** A cold mail from `f20251097@pilani.bits-pilani.ac.in` is far
 less likely to be opened than one from *Pratham Jain*. Each member has a
 `sender_name`, edited by a lead in the **Sends as** column of the Team page, and
-blank falls back to their real name. It is resolved per claim rather than read
-from the agent's startup profile, so editing it takes effect on the next send
-with no laptop to restart. `GmailClient.send` builds the header with
-`email.utils.formataddr`, which quotes and encodes names that need it.
+blank falls back to their real name. It is resolved per claim rather than cached
+anywhere, so editing it takes effect on the very next mail with nothing to
+restart. `GmailClient.send` builds the header with `email.utils.formataddr`,
+which quotes and encodes names that need it.
 
 > If a recipient still sees the wrong name, check the Gmail account's own
 > "Send mail as" setting — Gmail can override the header we set.
 
-**CC / BCC** are entered on the local agent's send screen and apply to **every
-mail in that batch** — ten copied addresses on a 200-mail send is two thousand
-extra deliveries, and a CC is visible to each prospect. The agent does not apply
-them itself: they travel to the server with the claim, which validates every
-address, caps the list at `MAX_COPY_ADDRESSES` (10), stores them on each
-`campaign_mailings` row, and hands them back. A malformed address fails the whole
-request before a single row is written. Preflight echoes back the addresses the
-server accepted, and the send confirmation names them again.
+**CC / BCC** are entered on the Send screen and apply to **every mail in that
+batch** — ten copied addresses on a 200-mail send is two thousand extra
+deliveries, and a CC is visible to each prospect. They are not applied where
+they are typed: they are passed into `claim_batch`, which validates every
+address, caps the list at `MAX_COPY_ADDRESSES` (10) and stores them on each
+`campaign_mailings` row before anything is sent. A malformed address fails the
+whole claim before a single row is written, and the stored copy is what the
+sender reads — so the record of who was copied is the same object the mail was
+built from, not a parallel one. Preflight echoes back the addresses the server
+accepted.
 
 ### 5.3 Scheduled sending
 
@@ -503,18 +568,21 @@ constraint shapes everything:
 **The Gmail API has no `sendAt`.** Gmail's "Schedule send" is a feature of the
 web client, not the API. There is no way to hand Google a future time and walk
 away, so a scheduled mail requires a process that is *awake at that moment
-holding that member's Gmail token*. The CRM cannot be that process — it holds no
-Gmail credentials, deliberately (§2).
+holding that member's Gmail token*. The server is now that process (§2), which
+is the whole reason the migration was worth doing.
 
-So the server owns the queue and every rule, and an agent asks "anything due for
-me?" every 60 seconds. Run the `agent` compose profile on an always-on host and
-09:00 means 09:00; rely on a laptop and it means "whenever that laptop is next
-open", bounded by the grace window.
+So the server owns the queue, every rule **and** the credentials. A due job is
+picked up by `services/runner.py::tick()`, which leases it, sends it, and
+records progress. `scheduling.claim_due(member, …)` stays **per member**
+deliberately even though the server has every credential: the `member` filter is
+what guarantees a job sends from the mailbox it was queued against, and `sent_by`
+stops meaning anything without it. The tick loops over members rather than
+widening that query.
 
-An agent authenticates as exactly one member and may only run *that* member's
-jobs — anything else would send from the wrong mailbox and record a false
-`sent_by`. One always-on agent therefore covers one account; run one container
-per member to cover more.
+> **Read this before queueing anything.** `tick()` is not yet on a timer. A due
+> job waits until someone runs it — the **Send queued mail now** button on the
+> Schedules page, or `manage.py run_tick`. See [§13.3](#133-draining-the-send-queue),
+> and [§23](#23-known-gaps) for what is left to make it hands-off.
 
 Everything else is built on that: a **sending window** so nothing arrives at 3am,
 a **grace period** after which a job is `missed` rather than stale, **drip** to
@@ -582,7 +650,7 @@ def unmailable_reason(contact) -> tuple[str, str] | None:
 
 `preflight()` calls the **same helper**, so the dry run cannot disagree with the
 real thing about who is sendable. The check runs under the lock rather than
-trusting the agent's list, because someone may have archived the contact between
+trusting the posted list, because someone may have archived the contact between
 the page loading and Send being pressed.
 
 ---
@@ -592,22 +660,30 @@ the page loading and Send being pressed.
 ### The claim → send → report loop
 
 ```
-1. agent: POST /api/v1/mailings/claim {campaign_id, contact_ids[]}
+services/sending.py::send_batch, ten contacts at a time:
 
-2. server, ONE TRANSACTION PER CONTACT:
+1. mailing.claim_batch(campaign, member, chunk)
+
+2. ONE TRANSACTION PER CONTACT:
      SELECT ... FOR UPDATE the contact          ← row lock acquired
-     assigned to the caller?          no → skip NOT_ASSIGNED
+     assigned to this member?         no → skip NOT_ASSIGNED
      archived / blocked lifecycle?   yes → skip ARCHIVED | BLOCKED
-     render(campaign, contact)      fail → skip MISSING_VARS
-     INSERT CampaignMailing(DRAFT)         ← unique constraint fires on a dupe
+     render(root body + this member's footer)
+                                    fail → skip MISSING_VARS
+     INSERT CampaignMailing(DRAFT)         ← both unique constraints fire here
      COMMIT                                 ← lock released, DRAFT durable
    ────────────────────────────────────────────────────────────────────
-3. agent sends via its own Gmail             ← NO locks held anywhere
+3. GmailClient.send(), as the member                ← NO locks held anywhere
 
-4. agent: POST /api/v1/mailings/<id>/result
-     {status: "sent",   message_id, thread_id}  → SENT  + lifecycle flip
-     {status: "failed", error}                  → FAILED + error_detail
+4. mailing.record_result(mailing_id, member, ...)
+     status="sent"   + message_id, thread_id  → SENT  + lifecycle flip
+     status="failed" + error                  → FAILED + error_detail
 ```
+
+This was four steps over HTTP when a laptop agent did the sending. Removing the
+transport removed a network hop, not a layer of logic: the ordering below is
+unchanged, and it is the ordering — not where the code runs — that is the
+guarantee.
 
 ### Why this exact ordering
 
@@ -629,28 +705,22 @@ and the server never heard back. Nothing will happen to it on its own, and until
 it is resolved that contact **cannot be mailed for that campaign again** — the
 unique constraint that prevents double-sending also prevents re-sending.
 
-Resolve them from the member's own agent with **Resolve stranded drafts**, which
-asks Gmail which ones actually went out. Anything that did is recorded as sent;
-anything that did not becomes `failed`, and a failed mailing **can** be claimed
-again — so re-selecting those contacts and pressing Send simply works.
+`services/sending.py::reconcile` resolves them by asking Gmail which ones
+actually went out, using `GmailClient.find_message_to()`. Anything that did is
+recorded as sent; anything that did not becomes `failed`, and a failed mailing
+**can** be claimed again — so re-selecting those contacts and pressing Send
+simply works. It never re-sends blindly, because a DRAFT may already be sitting
+in a prospect's inbox with only the report lost.
 
-`manage.py stranded_drafts` reports the backlog and names who has to clear it.
-Only that member's agent can: the mail left their mailbox, and only they hold the
-Gmail credentials to check it.
-
-#### The original design
-
-If the agent dies between steps 2 and 4, DRAFTs are left behind.
-`GET /mailings/drafts` lists your own; **Resolve stranded drafts** uses
-`GmailClient.find_message_to()` to ask **Gmail itself** whether that mail went
-out, and settles the row to `SENT` or `FAILED` accordingly. It never re-sends
-blindly.
+`manage.py stranded_drafts` reports the backlog and names whose mailbox each one
+belongs to — reconciliation runs against that member's Gmail credential, so the
+answer comes from the mailbox the mail would have left.
 
 ### Daily cap
 
 `DAILY_SEND_CAP = 400`, enforced inside `claim_batch` by counting
 `sent_last_24h(member)`. Server-side deliberately — it counts across every device
-a member uses, so nobody evades it by opening the agent on a second laptop.
+a member uses, and across the whole team's shared instance.
 Gmail's real per-account quota, once tripped, throttles the whole mailbox for
 hours.
 
@@ -719,87 +789,42 @@ replaces the rows and would otherwise take the listeners with them.
 | `/campaigns/<id>/` | Funnel, live preview, status transitions | any member |
 | `/campaigns/new/` · `/campaigns/<id>/edit/` | Template editor: placeholder validation, **Insert link**, HTML toggle | **lead** |
 | `/schedules/` | Every scheduled send; `missed`/`failed` called out, lead-only cancel | member |
-| `/members/` | Team load, **Sends as** names, issue/revoke API tokens | **lead** |
-| `/login/` | Sign in — name list, or Google | anyone |
+| `/send/` | Your queue for a campaign → dry run → **Send** | any member |
+| `/campaigns/<id>/footer/` | Your own sign-off on a campaign | any member |
+| `/teams/` | The teams you are on | any member |
+| `/teams/<id>/` | Join code, roles, campaigns | **lead** |
+| `/teams/<id>/distribute/` | Round-robin a filtered slice across the team | **lead** |
+| `/settings/gmail/` | Connect / disconnect your Gmail | any member |
+| `/members/` | Team load, **Sends as** names, Gmail status | **lead** |
+| `/login/` | Sign in with Google | anyone |
+| `/join/` | Enter a team join code (after Google sign-in) | verified BITS account |
+| `/healthz` | Liveness probe — no auth, no DB query | anyone |
 | `/admin/` | Django admin | superuser (password auth, separate) |
 
-### Local agent — `http://localhost:8111`
-
-Single page: campaign picker → CC/BCC → Verify Gmail → contact table (with tags,
-stage badge and a ✎ inline editor per row) → Preflight → **Send** or
-**Schedule…**, plus a **Scheduled** panel and **Resolve stranded drafts**. Editing CC/BCC re-locks Send until you preflight again, so
-the addresses that go out are always ones the dry run showed you.
-
 ---
 
-## 10. HTTP API
+## 10. HTTP API — removed
 
-All endpoints take `Authorization: Token <key>` and live under `/api/v1/`.
+There is no `/api/v1/` any more. It existed so a laptop agent could claim
+mailings, report results and lease scheduled sends over HTTP; the server now
+does all of that in-process (`services/sending.py`, `services/runner.py`).
 
-| Method | Endpoint | Purpose |
-|---|---|---|
-| `GET` | `/me` | identity handshake, live quota |
-| `GET` | `/campaigns` | active campaigns only |
-| `GET` | `/contacts?campaign_id=` | the caller's assigned contacts, archived excluded |
-| `POST` | `/contacts/new` | add a contact, force-assigned to the caller |
-| `PATCH` | `/contacts/<id>` | edit, guarded by `can_edit_contact` |
-| `POST` | `/mailings/preflight` | dry run, **writes nothing**; echoes back the accepted `cc`/`bcc` |
-| `POST` | `/mailings/claim` | reserve DRAFTs, returns the rendered mail and its envelope |
-| `POST` | `/mailings/<id>/result` | record sent/failed |
-| `GET` | `/mailings/drafts` | stranded DRAFTs to reconcile |
-| `GET`/`POST` | `/schedules` | list, or queue a send for later |
-| `POST` | `/schedules/claim` | lease due jobs; also sweeps stale leases, missed jobs and follow-ups |
-| `POST` | `/schedules/<id>/progress` | report a slice, advance the cursor |
-| `POST` | `/schedules/<id>/cancel` · `/reschedule` | |
-| `GET` | `/replies/scan` | threads worth re-reading for a reply |
-| `POST` | `/replies/<mailing_id>` | report what Gmail said |
+**Deleting it was a safety decision, not tidying.** Leaving `mailings/claim`
+reachable while the server also sends means two independent senders can hold the
+same DRAFT row — and `record_result`'s "already settled" guard would then turn a
+real double-send into a silently ignored report. A token-authenticated surface
+with no consumer is attack surface with no upside.
 
-Contact payload:
-
-```json
-{
-  "id": "…", "name": "Rohan Iyer", "first_name": "Rohan", "last_name": "Iyer",
-  "email": "rohan@example.com", "phone_no": "", "linkedin": "",
-  "company": "Zerodha", "designation": "CTO",
-  "tags": ["fintech", "priority"],
-  "lifecycle": "new", "lifecycle_label": "New",
-  "mailable": true, "already_mailed": false, "last_contacted_at": null
-}
-```
-
-`preflight` and `claim` both accept optional `cc` and `bcc` — comma-separated
-strings, validated server-side (see [§5.2](#52-sender-name-cc-and-bcc)). A
-claimed item carries everything needed to build the message and nothing the
-agent has to decide:
-
-```json
-{
-  "mailing_id": "…", "contact_id": "…", "to": "rohan@example.com", "name": "Rohan Iyer",
-  "subject": "Zerodha x PIEDS",
-  "body": "Hi Rohan, want to book a call (https://cal.com/pieds)?",
-  "body_html": "<!doctype html><html><body …>…</body></html>",
-  "from_name": "Pratham Jain", "cc": "lead@pieds.in", "bcc": ""
-}
-```
-
-CORS is not configured and is not needed — the agent is a server-side HTTP
-client, not a browser.
-
-### Agent's own routes (`:8111`)
-
-`GET /` (the UI), `/health`, `/auth/verify`, `/api/me`, `/api/campaigns`,
-`/api/contacts`, `POST /api/contacts`, `PATCH /api/contacts/{id}`,
-`/api/preflight`, `/api/send` (NDJSON stream), `/api/drafts`, `/api/reconcile`.
-All thin proxies to the CRM except `/auth/verify` and `/api/send`, which touch
-Gmail.
-
----
+The `ApiToken` table is kept for now as a record of who was issued what, and
+migration `0015` revoked every live token. Its UI, its `manage.py issue_token`
+command and all of its routes are gone. Drop the table in a later cleanup —
+that is the one migration with no cheap rollback.
 
 ## 11. Services — where the rules live
 
-Every rule lives in `core_django/crm/services/`. The agent is a dumb pipe with a
-mailbox. Change behaviour here and it takes effect for everyone immediately, with
-no laptop to update.
+Every rule lives in `core_django/crm/services/`. Change behaviour here and it
+takes effect for everyone immediately — there is nothing on anyone's laptop to
+update, which is the main practical dividend of retiring the agent.
 
 | Module | Contents |
 |---|---|
@@ -839,7 +864,7 @@ against that set **and** against the campaign's declared `var_list`, so
 
 ```bash
 git clone <repo> && cd ignite_crm
-cp .env.example .env               # leave the agent section blank for now
+cp .env.example .env               # Google/Gmail values can wait until §15
 
 docker compose up --build
 ```
@@ -850,8 +875,8 @@ move to a hosted database (§14).
 
 That is everything: Postgres 16, migrations, `check_db`, `seed_dev`, and
 gunicorn on <http://localhost:8000>. Nothing is installed on the host — no venv,
-no Python version to match. See §13.1 for what it actually does and how to add
-the agent.
+no Python version to match. One container, because there is only one process
+now. See §13.1 for what it actually does.
 
 Requires only Docker. If another project already owns port 5432, run
 `PG_HOST_PORT=5442 docker compose up --build` — that changes the *host* port
@@ -878,8 +903,10 @@ cd core_django
 `seed_dev` creates one team (`PIEDS Outreach`, join code `DEVCODE123`) and four
 members on it — `aarav`, `diya` (leads) and `kabir`, `ishita` (members) — plus
 ~50 contacts with assorted tags and
-lifecycles, and one active campaign. The two leads can sign in immediately by
-picking their name; the 2025 members need Google configured (§15.1).
+lifecycles, and one active campaign. **Everyone signs in with Google**, so
+configure `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET` (§15.1) before
+expecting to get in — there is no name-dropdown fallback any more, and §4.1
+explains why it was deleted rather than kept for local convenience.
 
 ---
 
@@ -891,10 +918,11 @@ picking their name; the 2025 members need Google configured (§15.1).
 docker compose up --build          # postgres + CRM   → http://localhost:8000
 ```
 
-One image (`./Dockerfile`) contains both apps, because they share `shared/` and
-the same dependency set. Compose decides which one a container runs by choosing
-an entrypoint. **The split is enforced by environment, not by files:** the agent
-container is simply never given `DATABASE_URL`.
+One image (`./Dockerfile`), one service. It used to ship two apps and let compose
+pick between them with an entrypoint; the sending agent is gone, so the image's
+`CMD` now carries the full gunicorn argv and compose overrides nothing. That
+matters: it means compose and the hosting platform start the container
+identically, which is the only way "it works in compose" means anything.
 
 `docker/entrypoint-crm.sh` runs before gunicorn and, in order: prints the
 database it is about to use, blocks on `pg_isready`, migrates *if the database is
@@ -925,76 +953,73 @@ has to remember to flip:
 | `check_db` | **always** | **always** |
 
 Skipping migrations is safe precisely because `check_db` is not skipped: a
-laptop pointed at a database whose schema was never built exits non-zero with
+container pointed at a database whose schema was never built exits non-zero with
 `MISSING campaign_mailings.uniq_campaign_contact` rather than serving a CRM that
 can double-mail. The guard is in `seed_dev.py` as well as the entrypoint,
 because someone typing the command by hand deserves the same protection.
 
-`DJANGO_ALLOWED_HOSTS` gets `crm` **appended**, not defaulted — the agent
-container reaches the CRM by that hostname and Django validates `Host`, so a
-`.env` listing only `localhost` must not be able to drop it.
-
-#### Adding the agent
-
-The agent is behind a profile because it cannot start unprepared: it needs an
-API token that only exists once the CRM is up, and a Gmail consent that has to
-happen in a real browser.
-
-```bash
-# 1. token (the /members/ page is the normal path; this is for bootstrapping)
-docker compose exec crm python core_django/manage.py issue_token \
-    aarav@pilani.bits-pilani.ac.in --label docker
-
-# 2. paste AGENT_API_TOKEN and AGENT_MEMBER_EMAIL into .env
-
-# 3. Gmail consent — ONCE, on the host, because the OAuth flow opens a browser
-#    and binds 127.0.0.1:8080 inside whatever runs it
-mkdir -p ~/.ignite_crm && cp client_secret.json ~/.ignite_crm/
-.venv/bin/uvicorn local_agent.main:app --port 8111    # press "Verify Gmail", then Ctrl-C
-
-# 4. now the container reuses that cached token
-docker compose --profile agent up --build             # → http://localhost:8111
-```
-
-`~/.ignite_crm` is mounted at `/tokens`, holding both `client_secret.json` and
-the cached `token_*.json`. Step 3 is a one-time cost per member; after it, the
-agent is `docker compose --profile agent up` forever.
-
-The agent container's own entrypoint fails fast with an explanation when
-`AGENT_API_TOKEN` is empty, rather than letting uvicorn crash-loop on the
-lifespan identity check.
+`DJANGO_ALLOWED_HOSTS` gets `crm` **appended**, not defaulted — Django validates
+the `Host` header, and a `.env` listing only `localhost` must not be able to drop
+the compose service name.
 
 ### 13.2 Native
 
-Three terminals, from the repo root:
+Two terminals, from the repo root:
 
 ```bash
 # 1. database
 docker compose up -d postgres
 
-# 2. backend — the CRM                          → http://localhost:8000
+# 2. the CRM                                    → http://localhost:8000
 cd core_django && ../.venv/bin/python manage.py runserver 8000
-
-# 3. local agent                                → http://localhost:8111
-.venv/bin/uvicorn local_agent.main:app --port 8111
 ```
 
-Log in at <http://localhost:8000/login/>:
+`seed_dev` creates the team `PIEDS Outreach` with join code `DEVCODE123`. Sign
+in at <http://localhost:8000/login/> with a BITS Google account — set
+`GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET` first, or the door says
+so rather than degrading to something weaker.
 
-| User | Batch | Sees |
+| Seeded member | Role | Sees |
 |---|---|---|
-| Aarav (pick the name) | 2024 lead | everything |
-| Kabir (Google sign-in) | 2025 | 403 on `/assign/`, `/contacts/import/`, `/campaigns/new/`, `/members/` |
+| Aarav, Diya | lead | everything |
+| Kabir, Ishita | member | 403 on `/assign/`, `/contacts/import/`, `/campaigns/new/`, `/teams/<id>/` |
 
-The agent runs as whichever member `AGENT_API_TOKEN` belongs to.
+### 13.3 Draining the send queue
+
+**Pressing Send does not send.** It commits a `ScheduledSend` due now and
+returns, deliberately: a Render instance can be reaped mid-request, so streaming
+a 200-mail batch inside one HTTP response makes "the tab was closed" a data
+question. Queueing makes it a non-event and reuses the lease, drip and recovery
+machinery that scheduled sends already had.
+
+Something must then drain the queue. Two doors, one code path
+(`services/runner.py::tick()`):
+
+| | |
+|---|---|
+| **Send queued mail now** on `/schedules/` | lead-only, POST, what the team actually uses |
+| `manage.py run_tick` | the same function from a shell, for local runs |
+
+A tick is bounded — `TICK_MAX_MAILS` (40) and `TICK_MAX_SECONDS` (45) — so it
+fits inside a request. Press it again for more. It is safe to press twice at
+once: `claim_due` uses `SELECT … FOR UPDATE SKIP LOCKED`, and
+`uniq_root_campaign_contact` is the real guarantee underneath regardless.
+
+> **This is the one thing that is not hands-off yet.** The automatic scheduler —
+> an authenticated `/internal/tick` endpoint, a `pg_try_advisory_lock`, and an
+> external pinger — is designed in `docs/MAIL_SCHEDULING.md` and deliberately
+> **deferred**. Nothing about it changes the queue, the lease protocol or
+> `tick()` itself; it adds a door and a lock in front of an executor that
+> already exists and is already tested. Until it lands, mail leaves the building
+> when a lead presses the button. See [§23](#23-known-gaps).
 
 ---
 
 ## 14. Supabase — the master database
 
 Supabase replaces the Docker Postgres. It changes nothing about the
-architecture: Django remains the only process that connects to it, and laptops
-still hold no database credentials.
+architecture: Django is the only process that connects to it, and it always
+was.
 
 ### 14.1 Use the session pooler
 
@@ -1015,7 +1040,7 @@ Three ways to get this wrong, worst first:
 `DB_CONN_MAX_AGE` defaults to `0`. Persistent connections eat pooler slots on the
 free tier faster than traffic does.
 
-### 14.2 What changes in `.env` on every laptop
+### 14.2 What changes in `.env`
 
 ```diff
 - COMPOSE_PROFILES=localdb                    # stop running a database nobody uses
@@ -1023,8 +1048,11 @@ free tier faster than traffic does.
 ```
 
 Nothing else. `RUN_MIGRATIONS` and `SEED_DEV` notice the host is not local and
-switch themselves off (§13.1) — on the one machine that owns the schema, set
-`RUN_MIGRATIONS=true`.
+switch themselves off (§13.1) — **on the deployed instance, which owns the
+schema, set `RUN_MIGRATIONS=true` explicitly.** Forgetting it is the single most
+likely deploy failure, and it presents as a broken app rather than a missing
+variable: migrations are skipped, then the unconditional `check_db` refuses to
+serve. See §16.
 
 ### 14.3 Cutover
 
@@ -1078,98 +1106,168 @@ ignite: tests pinned to localhost:5432/ignite_crm (never the hosted database)
 ```
 
 Verified by running the suite with `DATABASE_URL` pointed at a fake Supabase
-host: all 76 tests still pass against localhost.
+host: all 290 tests still pass against localhost.
 
 ---
 
 ## 15. Google setup
 
-**Two OAuth clients, one Google Cloud project.** They are not interchangeable and
-mixing them up is the most likely thing to go wrong here:
+**One OAuth client, one Google Cloud project.** There used to be two — a Desktop
+client for the laptop agent's Gmail consent and a Web client for sign-in — and
+mixing them up was the most likely thing to go wrong. The Desktop client is no
+longer used at all and can be deleted once the cutover is proven.
 
-| | client type | used by | for |
-|---|---|---|---|
-| `client_secret.json` | **Desktop app** | `local_agent` | sending mail as the member |
-| `GOOGLE_OAUTH_CLIENT_ID/SECRET` | **Web application** | `core_django` | batch-2025 sign-in |
+The single **Web application** client does both jobs, through two separate
+consent steps:
 
-### 15.1 Web client — sign-in, for everyone
+| Step | Scopes | When |
+|---|---|---|
+| Sign-in | `openid`, `userinfo.email`, `userinfo.profile` | every login |
+| Gmail | `gmail.send`, `gmail.readonly` | once, at `/settings/gmail/` |
+
+They are deliberately separate. A person should be able to sign in and look
+around before handing over their mailbox, and a declined Gmail consent must not
+lock them out of the CRM.
+
+### 15.1 Creating the client
 
 1. **Credentials → Create OAuth client ID → Web application**.
-2. Authorised redirect URI, exactly:
-   `http://localhost:8000/login/google/callback/`
-   (add your public URL too if you host the CRM).
-3. Put the id and secret in `.env` as `GOOGLE_OAUTH_CLIENT_ID` /
+2. Authorised redirect URIs — **both**, for every hostname the app answers on:
+   ```
+   http://localhost:8000/login/google/callback/
+   http://localhost:8000/settings/gmail/callback/
+   https://<your-domain>/login/google/callback/
+   https://<your-domain>/settings/gmail/callback/
+   ```
+3. Enable the **Gmail API** on the project.
+4. Put the id and secret in the environment as `GOOGLE_OAUTH_CLIENT_ID` /
    `GOOGLE_OAUTH_CLIENT_SECRET`.
 
-Leave them blank and the Google door is disabled with a message on the login
-page rather than a stack trace — but **no batch-2025 member can sign in to the
-CRM until they are set**. They can still send: the agent authenticates with an
-API token, not a browser session.
+Leave them blank and both doors are disabled with a message rather than a stack
+trace — but **nobody can sign in at all**. There is no second door.
 
-`GOOGLE_OAUTH_HOSTED_DOMAIN` defaults to `pilani.bits-pilani.ac.in` and is
-checked against the signed `hd` claim, so a personal Gmail is refused even if
-somebody put one in the pool. Sign-in never creates a member — an address with
-no active `TeamMember` is turned away.
+### 15.2 The consent screen — set user type to Internal
 
-### 15.2 Desktop client — sending
+This is the setting that decides whether the whole thing keeps working, and it is
+worth getting right the first time.
 
-One-time, per member:
+| User type | Refresh tokens | Verification | Cap |
+|---|---|---|---|
+| **Internal** (Workspace org) | **never expire** | none needed | none |
+| External + In production | persist | needed for `gmail.readonly` eventually | 100 unverified |
+| External + **Testing** | **die after 7 days** | — | 100 |
 
-1. **Google Cloud Console** → same project → enable the **Gmail API**.
-2. **OAuth consent screen** → External → add each team member as a test user.
-3. **Credentials → Create OAuth client ID → Desktop app** → download the JSON as
-   `client_secret.json` at the repo root (gitignored).
-4. Ask a lead to issue you a token on `/members/`. **It is shown once.**
-5. Fill in `.env`: `AGENT_API_BASE_URL`, `AGENT_API_TOKEN`, `AGENT_MEMBER_EMAIL`.
-6. Start the agent and press **Verify Gmail** — the consent screen appears once.
+**Set user type to Internal** if the Cloud project belongs to the
+`pilani.bits-pilani.ac.in` Google Workspace organisation. Internal apps skip
+verification entirely, have no user cap, and — the one that matters — their
+refresh tokens do not expire. That last point removes the single largest
+operational risk in this migration: an **External** app left in **Testing**
+revokes every refresh token after **7 days**, so sending silently stops a week
+after launch and nobody knows why.
 
-Scopes requested: `gmail.send` and `gmail.readonly`. Readonly is needed for
-stranded-draft reconciliation — asking Gmail whether a mail actually went out.
-Cached tokens live in `~/.ignite_crm`, `chmod 600`.
+Internal also permanently removes a future problem: `gmail.readonly` is a
+*restricted* scope, which for an External app would eventually require a paid
+third-party security assessment.
 
-Each person needs **their own** token. Never share one — the token is what makes
-`sent_by` meaningful.
+Three things to check, in this order:
+
+1. **Does the Cloud project sit under the BITS Workspace org?** "Internal" only
+   appears as an option if it does. If student accounts cannot create projects in
+   the org, the project lands under *No organization* and the option is greyed
+   out. This is the one that decides everything else.
+2. **Has the Workspace admin blocked third-party Gmail access?** Education orgs
+   commonly restrict it. You would see `access_denied` / "This app is blocked" on
+   the first consent, so test with one account early.
+3. Refresh tokens still die after **6 months of inactivity**, and there is a
+   50-tokens-per-user-per-client cap. Neither matters at this usage, but the code
+   does not assume a token lives forever — a dead credential is recorded on the
+   row and the member is asked to reconnect.
+
+### 15.3 What each member does
+
+Once, in a browser: sign in, open **Gmail** in the sidebar, press **Connect
+Gmail**, and grant both permissions. That is the whole setup — no Python, no
+client secret, no `uvicorn`.
+
+Granting from the wrong Google account is refused by name: the account that
+grants is compared against the member's `bits_email`, because `sent_by` is only
+meaningful if the token really belongs to the person it names.
 
 ---
 
 ## 16. Deploying
 
-```bash
-docker build -t ignite-crm .        # from the repo root; `shared/` needs it
-```
+One **Render** web service on the free plan, Docker runtime, health check path
+`/healthz`. `render.yaml` at the repo root is the blueprint; every value below is
+either in it or marked `sync: false` for you to paste in.
 
-The image's default command is the CRM, behind the same entrypoint compose uses,
-so a deploy verifies the database before it serves:
+### Why one service
 
-```bash
-docker run -p 8000:8000 --env-file prod.env ignite-crm
-```
+Render's free plan allows **750 instance-hours per workspace per calendar
+month** against a ~730-hour month. That budget covers **exactly one** always-awake
+service — there is no room for a separate worker, which is why sending runs
+inside the web process rather than beside it. Free plans also have **no cron
+jobs** and **no shell**, which is why the queue is drained from a button in the
+UI rather than a scheduled command.
 
-**Set `RUN_MIGRATIONS=true` in `prod.env`.** A deploy's `DATABASE_URL` is
-Supabase, which the entrypoint reads as a shared database and therefore does
-*not* migrate by default (§13.1) — the rule that stops five laptops racing each
-other also stops your one server, and it has no way to tell the difference.
-Without it, `check_db` fails the boot on the first deploy after a migration.
-
-App-level environment variables:
+### Environment
 
 | Variable | Value |
 |---|---|
-| `DATABASE_URL` | the Supabase session-pooler URL |
-| `DJANGO_SECRET_KEY` | `python -c "import secrets; print(secrets.token_urlsafe(50))"` |
-| `DJANGO_ALLOWED_HOSTS` | your public hostname |
+| `DATABASE_URL` | Supabase **session pooler, port 5432**, `?sslmode=require` |
+| `GMAIL_TOKEN_KEY` | `python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'` |
+| `GOOGLE_OAUTH_CLIENT_ID` / `_SECRET` | the Web client from §15 |
+| `DJANGO_SECRET_KEY` | generated; the app **refuses to boot** on the shipped dev key |
+| `DJANGO_ALLOWED_HOSTS` | `crm.example.com,.onrender.com` — a leading dot is Django's subdomain wildcard |
 | `DJANGO_DEBUG` | `False` |
+| `RUN_MIGRATIONS` | **`true`** — see below |
+| `DB_CONN_MAX_AGE` | `0` |
+| `WEB_CONCURRENCY` | `2` |
 
-With `DEBUG=False`, `settings.py` automatically enables `SECURE_SSL_REDIRECT`,
-`SECURE_PROXY_SSL_HEADER`, `SESSION_COOKIE_SECURE`, `CSRF_COOKIE_SECURE`,
-one-year HSTS with subdomains, `X_FRAME_OPTIONS=DENY`, `CSRF_TRUSTED_ORIGINS`
-derived from `ALLOWED_HOSTS`, and `CompressedManifestStaticFilesStorage`.
+### The five things that will actually bite
 
-The entrypoint is the release step — it migrates (given `RUN_MIGRATIONS=true`)
-and runs `check_db` before gunicorn binds. Static files are built into the image
-via `collectstatic` and served by whitenoise — no nginx needed.
+1. **`RUN_MIGRATIONS=true` is not optional and is the most likely omission.**
+   `docker/entrypoint-crm.sh` derives it from whether the database looks local,
+   reads Supabase as shared, and therefore *skips* migrations — the rule that
+   stops five laptops racing each other also stops your one server, and it has no
+   way to tell the difference. The unconditional `check_db` then fails the boot.
+   That failure is correct behaviour and will look exactly like a broken deploy.
 
-Then point each member's `AGENT_API_BASE_URL` at the public HTTPS host.
+2. **`GMAIL_TOKEN_KEY` must be set**, or `check_db` refuses to start. Deliberate:
+   a CRM that boots and then cannot send is worse than one that will not boot.
+   Generate a *different* key from your local one, and keep it in Render's
+   environment — never in the database, since protecting against a database leak
+   is the entire point of it.
+
+3. **Never port 6543.** That is Supabase's transaction pooler, which silently
+   breaks `SELECT … FOR UPDATE`. `check_db` refuses it outright.
+
+4. **Deploying with `DEBUG=True` breaks Google sign-in in a confusing way.**
+   `SECURE_PROXY_SSL_HEADER` is only set when `DEBUG=False`, so behind Render's
+   TLS proxy `request.build_absolute_uri` produces an `http://` redirect URI that
+   Google rejects. It presents as "Google is broken", not as a settings mistake.
+
+5. **Both redirect URIs, for every hostname.** `/login/google/callback/` *and*
+   `/settings/gmail/callback/`, on the `.onrender.com` host as well as your
+   custom domain.
+
+With `DEBUG=False`, `settings.py` enables `SECURE_SSL_REDIRECT` (exempting
+`/healthz`, or the platform health check gets a 301 and marks every deploy
+unhealthy), `SECURE_PROXY_SSL_HEADER`, secure cookies, one-year HSTS with
+subdomains, `X_FRAME_OPTIONS=DENY`, `CSRF_TRUSTED_ORIGINS`, and
+`CompressedManifestStaticFilesStorage`. Static files are built into the image by
+`collectstatic` and served by whitenoise — no nginx.
+
+The entrypoint is the release step: it waits for Postgres, migrates, and runs
+`check_db` before gunicorn binds.
+
+### Not yet automatic
+
+**Queued mail does not send on its own.** A lead presses **Send queued mail now**
+on `/schedules/`. The automatic scheduler — an authenticated tick endpoint, a
+session-level advisory lock, and an external pinger every 1–2 minutes — is
+designed but not deployed; see `docs/MAIL_SCHEDULING.md`. The ping interval is a
+*throughput* setting, not just a keep-alive one, so read that before choosing it.
 
 ---
 
@@ -1179,35 +1277,56 @@ Then point each member's `AGENT_API_BASE_URL` at the public HTTPS host.
 .venv/bin/python -m pytest          # needs docker compose up
 ```
 
-**181 tests**, all passing:
+**290 tests**, all passing:
 
 | File | Count | Covers |
 |---|---|---|
-| `test_constraints.py` | 13 | the unique constraint, permissions, status transitions |
-| `test_mailing_api.py` | 19 | token auth, claim/report, preflight, drafts, retry |
-| `test_contacts_crud.py` | 33 | edit scoping, lifecycle rules, archive/delete, audit, HTTP layer |
-| `test_login.py` | 11 | the two doors — see §4.1 |
-| `test_campaign_links.py` | 17 | link syntax, escaping, scheme rejection, both body parts |
+| `test_scheduling.py` | 48 | the queue, the lease, the sending window, grace, drip, `tick()` |
+| `test_teams.py` | 36 | join codes, roles, `assignable_members`, distribution, audit |
+| `test_campaign_hierarchy.py` | 36 | roots and sub-campaigns, footers, root-scoped dedupe |
+| `test_contacts_crud.py` | 32 | edit scoping, lifecycle rules, archive/delete, audit, HTTP layer |
+| `test_gmail_credentials.py` | 29 | encryption, key rotation, connect/disconnect, identity binding |
 | `test_campaign_headers.py` | 23 | sender name, CC/BCC validation and snapshot, HTML bodies |
-| `test_scheduling.py` | 48 | the queue, the lease, the sending window, grace, drip |
+| `test_campaign_links.py` | 17 | link syntax, escaping, scheme rejection, both body parts |
 | `test_followups.py` | 17 | reply detection, who gets chased, the lifecycle opt-in |
+| `test_mailing.py` | 16 | claim/report, preflight, stranded drafts, the daily cap |
+| `test_constraints.py` | 16 | both unique constraints, `NOT NULL`, status transitions |
+| `test_login.py` | 11 | the one door, and that the deleted one stays deleted (§4.1) |
+| `test_send_recovery.py` | 9 | the 19 Aug incident: chunking, retry, no double-send |
+
+`test_mailing.py` used to be `test_mailing_api.py`, driven through the token API
+the laptop agent spoke. Only the tests genuinely *about* the API — bearer-token
+auth, HTTP status codes — were dropped; every rule they happened to exercise
+through it was rewritten against the service functions directly, which is where
+the rules always lived.
 
 The single most important test:
 
 ```python
-def test_claiming_twice_yields_no_second_mailing(...):
-    first  = claim(client, auth, campaign, [contact.id]).json()
-    second = claim(client, auth, campaign, [contact.id]).json()
-    assert len(first["claimed"]) == 1
-    assert second["claimed"] == []
-    assert "already has a mailing" in second["skipped"][0]["reason"]
-    assert CampaignMailing.objects.filter(contact=contact).count() == 1
+# test_campaign_hierarchy.py::TestTheDuplicateMailBug
+def test_the_second_member_is_told_who_reached_them(self, root, contact, kabir, ishita):
+    kabir_c  = campaign_svc.sub_campaign_for(root, kabir)
+    mailing.claim_batch(kabir_c, kabir, [contact.id])
+
+    ishita_c = campaign_svc.sub_campaign_for(root, ishita)
+    claimed, skipped = mailing.claim_batch(ishita_c, ishita, [contact.id])
+
+    assert claimed == []
+    assert skipped[0].code == mailing.ALREADY_MAILED
+    assert "Kabir" in skipped[0].reason        # named, not a bare "already mailed"
 ```
 
-If that ever fails, the system can put two copies of the same mail in a
-prospect's inbox. Everything else is negotiable.
+Its sibling `test_two_members_cannot_both_mail_one_contact` pins the same fact
+one layer down, at the database: the second `CampaignMailing.objects.create`
+raises `IntegrityError` and exactly one row survives. Two tests because the
+constraint is the guarantee and the claim is only the polite way of hitting it —
+if the service ever stops checking, the database must still refuse.
 
-Other guarantees pinned by tests: a 2025 member gets `PermissionDenied` editing
+If that ever fails, the system can put two copies of the same cold mail in a
+prospect's inbox under two different banners — which is the exact bug this
+migration existed to kill. Everything else is negotiable.
+
+Other guarantees pinned by tests: a non-lead gets `PermissionDenied` editing
 someone else's contact; a posted `lifecycle` is dropped for non-leads while the
 rest of the edit still applies; `bulk_edit` silently skips contacts outside the
 caller's list; a mailed contact refuses hard delete with a message rather than a
@@ -1229,23 +1348,29 @@ naming its actor.
 | `DJANGO_DEBUG` | `False` | |
 | `DJANGO_ALLOWED_HOSTS` | `localhost,127.0.0.1` | |
 | `DB_CONN_MAX_AGE` | `0` | persistent connections; keep 0 behind a pooler |
-| `GOOGLE_OAUTH_CLIENT_ID` | — | **Web** client; blank disables batch-2025 sign-in |
+| `GOOGLE_OAUTH_CLIENT_ID` | — | **Web** client; blank disables sign-in entirely |
 | `GOOGLE_OAUTH_CLIENT_SECRET` | — | pairs with the above |
 | `GOOGLE_OAUTH_HOSTED_DOMAIN` | `pilani.bits-pilani.ac.in` | checked against the signed `hd` claim |
 | `DB_TRANSACTION_POOLER` | `False` | only for port 6543 |
 
-### Agent (`local_agent`) — no `DATABASE_URL`, by design
-| Variable | Notes |
-|---|---|
-| `AGENT_API_BASE_URL` | the CRM's URL; HTTPS in production |
-| `AGENT_API_TOKEN` | issued on `/members/`, shown once |
-| `AGENT_MEMBER_EMAIL` | must match both the token owner and the Gmail account |
-| `GOOGLE_CLIENT_SECRETS_PATH` | default `./client_secret.json` |
-| `AGENT_TOKEN_DIR` | default `~/.ignite_crm` |
-| `AGENT_SEND_DELAY_SECONDS` | default `2`; the hard cap is server-side |
+### Sending
+| Variable | Default | Notes |
+|---|---|---|
+| `GMAIL_TOKEN_KEY` | — | **required.** Fernet key encrypting every refresh token. `check_db` fails the boot without it. Rotate as `2:<new>,1:<old>` |
+| `GMAIL_SEND_DELAY_SECONDS` | `0` | pause between messages in one run |
+| `GMAIL_TOKEN_EXPIRY_SKEW_SECONDS` | `120` | slack when deciding a cached access token is still usable |
 
-Gitignored and never committed: `.env`, `client_secret.json`, `token_*.json`,
-`.ignite_crm/`.
+### Hosting
+| Variable | Default | Notes |
+|---|---|---|
+| `PORT` | `8000` | injected by the platform; the container binds it |
+| `WEB_CONCURRENCY` | `2` | gunicorn workers. Three does not fit 512 MB beside the Google client |
+| `WEB_THREADS` | `4` | |
+| `DJANGO_CSRF_TRUSTED_ORIGINS` | derived | needed only if `ALLOWED_HOSTS` is `*` |
+| `DJANGO_LOG_LEVEL` | `INFO` | logs go to stdout, which is what platforms capture |
+| `DATA_UPLOAD_MAX_MEMORY_SIZE` | 2.5 MB | CSV import buffers into the DB-backed session |
+
+Gitignored and never committed: `.env`.
 
 ---
 
@@ -1255,8 +1380,8 @@ Gitignored and never committed: `.env`, `client_secret.json`, `token_*.json`,
 cd core_django
 
 ../.venv/bin/python manage.py check_db     # verify the live DB is safe to send from
-../.venv/bin/python manage.py seed_dev     # dev fixtures
-../.venv/bin/python manage.py issue_token <email> --label <name>   # shown once
+../.venv/bin/python manage.py seed_dev     # dev fixtures (team + join code)
+../.venv/bin/python manage.py run_tick     # drain the queued sends once
 ../.venv/bin/python manage.py migrate
 ../.venv/bin/python manage.py makemigrations
 ```
@@ -1294,14 +1419,14 @@ ignite_crm/
 ├── requirements-dev.txt      the above plus pytest
 ├── .env.example
 │
-├── shared/                        imported by BOTH apps
+├── shared/                        enums and vendored assets
 │   ├── enums.py                   CampaignStatus, MailingStatus, ContactLifecycle,
-│   │                              BLOCKED_LIFECYCLES, LEAD_BATCH
+│   │                              BLOCKED_LIFECYCLES   (LEAD_BATCH is gone — §4)
 │   └── static/basecoat/
 │       ├── basecoat.css  (213 KB) components, from basecoat-css@1.0.2
 │       ├── basecoat.js   (43 KB)  dialog, select, dropdown, toast, tabs
 │       ├── app.css                hand-written layout + lifecycle badge colours
-│       ├── poll.js                20s refresh, shared by both apps
+│       ├── poll.js                20s refresh
 │       └── VENDORED.md            provenance
 │
 ├── core_django/
@@ -1313,22 +1438,23 @@ ignite_crm/
 │       ├── forms.py               ContactForm, BulkEditForm, CampaignForm, …
 │       ├── views.py  urls.py      every screen
 │       ├── admin.py
-│       ├── services/              ← every rule (see §11), incl. auth.py
-│       ├── api/                   auth.py, views.py, urls.py
-│       ├── management/commands/   check_db.py, seed_dev.py, issue_token.py
-│       ├── migrations/            0001_initial, 0002_apitoken,
-│       │                          0003_contact_lifecycle_tags_archive
-│       ├── templates/crm/         14 templates
-│       └── tests/                 181 tests
+│       ├── services/              ← every rule (see §11)
+│       │     gmail.py             send as a member; the ported Gmail client
+│       │     gmail_oauth.py       the mailbox consent step
+│       │     secrets.py           refresh-token encryption + key versions
+│       │     sending.py           claim → send → record, chunked
+│       │     runner.py            one pass over everything due
+│       │     teams.py             join codes, roles
+│       ├── management/commands/   check_db.py, seed_dev.py, run_tick.py
+│       ├── migrations/            0001 … 0015_revoke_api_tokens
+│       ├── templates/crm/         19 templates
+│       └── tests/                 290 tests, incl. conftest.py
 │
-└── local_agent/
-    ├── main.py                    lifespan identity checks + 12 routes
-    ├── api_client.py              httpx wrapper — the only link to the CRM
-    ├── config.py
-    ├── services/send.py           claim → send → report, + reconcile
-    ├── gmail/client.py            OAuth, token storage, identity binding
-    └── templates/index.html       the send UI + inline editor
+└── render.yaml                    the hosting blueprint
 ```
+
+`local_agent/` and `crm/api/` are gone: sending moved into the server, and the
+token API that existed to serve a laptop was deleted rather than left reachable.
 
 ---
 
@@ -1494,16 +1620,27 @@ display name or substitutes the account's own "Send mail as" name, and how
 CC/BCC behave in a real batch. **Test any change to the send path with a batch
 of one to your own address before pointing it at real prospects.**
 
-**The local agent does not hot-reload.** It is run with plain `uvicorn`, no
-`--reload`, so a change under `local_agent/` does nothing until the process is
-restarted. This has already once looked exactly like a broken feature.
+**Nothing drains the send queue automatically.** This is the largest gap and
+the one to read first. Pressing Send commits a `ScheduledSend` due now; a
+scheduled send and a follow-up do the same. All of them then wait until someone
+runs `tick()` — the **Send queued mail now** button or `manage.py run_tick`
+(§13.3). Queued mail is not lost and not sent twice; it simply does not move on
+its own, and a job whose grace window closes first is marked `missed`.
 
-**Scheduled sending is only as reliable as where the agent runs.** Gmail has no
-`sendAt`, so a scheduled mail goes out only while an agent is running for that
-member (§5.3). One always-on container covers one account; everyone else's
-scheduled mail waits for their laptop, and is marked `missed` if the grace
-window closes first. That is a deployment property, not a bug to fix in code —
-but it is the first thing to check when a scheduled send did not arrive.
+What is missing is small and deliberately scoped: a `GET /internal/tick`
+authenticated with `secrets.compare_digest` against `TICK_SECRET`, a
+session-level `pg_try_advisory_lock` around the call, and an external pinger
+(Render's free plan has no cron). The executor it would sit in front of already
+exists and is already tested. `docs/MAIL_SCHEDULING.md` has the full design,
+including why an in-process thread from `AppConfig.ready()` was rejected.
+
+**The ping interval will be a throughput setting, not just a keep-alive one.**
+When that lands: a tick is capped at `TICK_MAX_MAILS` (40), so a 1-minute ping
+is ~2,000 mails/hour team-wide and a 10-minute ping is ~240. Ten minutes is the
+interval you would pick if you were only thinking about keeping the instance
+awake, and it would quietly turn a launch blast into most of a day. Say the new
+shape out loud before the first big campaign rather than letting the team
+discover it.
 
 **Reply detection reads the thread, not the meaning.** A follow-up is cancelled
 by any message from the prospect's address in the thread, including "wrong
@@ -1519,6 +1656,26 @@ dropdown and a button, a deliberate trade for a tool every lead ran on their own
 laptop. The route, the view, the service functions and the form are all deleted;
 see §4.1.
 
+**~~The dashboard shows no lifecycle funnel.~~** *Closed.* A member's landing
+page is now their own queue, and `lifecycle_counts()` finally has a caller.
+
+**The server can now impersonate a member, and that is a real loss.** It holds
+every refresh token; an application compromise — not merely a database leak —
+yields the ability to send as anyone on the team. Encryption at rest does not
+help with that case and §5's `gmail_credentials` note says so plainly. What
+stands in its place is narrower: `google_email` is checked against `bits_email`
+at grant time and re-verified against Gmail's own `getProfile` after any
+credential change, every send writes a durable `sent_by`, and a member can
+revoke the grant from their own Google account page without asking us. This was
+the price of a hosted CRM and it was paid knowingly; it is listed here so nobody
+rediscovers it as a surprise.
+
+**The consent screen's Internal user type is doing real work.** It is what
+removes the 7-day refresh-token expiry, the 100-user cap and the verification
+requirement (§15.2). It also means **only `@pilani.bits-pilani.ac.in` accounts
+can ever connect** — which is exactly what we want, and worth knowing before
+somebody tries to onboard an external collaborator.
+
 **`bounced` is never set automatically.** Nothing reads bounce notifications;
 a lead sets it by hand. Inferring it from SMTP error strings was judged worse
 than leaving it manual.
@@ -1529,5 +1686,6 @@ is always correct immediately; only the screens lag.
 **No rate limit on `claim` beyond the daily cap.** A member could claim 400 in
 one burst. Gmail's own throttling is the backstop.
 
-**The dashboard shows no lifecycle funnel yet.** `services/contacts.py`
-provides `lifecycle_counts()`, but no screen calls it.
+**`api_tokens` is a table nothing reads.** Kept rather than dropped, because a
+dropped table is the one migration with no cheap rollback. It should go in a
+later cleanup (§5).

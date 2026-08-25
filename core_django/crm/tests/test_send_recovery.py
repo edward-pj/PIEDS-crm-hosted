@@ -20,7 +20,7 @@ from django.utils import timezone
 
 from crm.models import Campaign, CampaignMailing, Contact, TeamMember
 from crm.services import mailing as svc
-from local_agent.services import send as send_svc
+from crm.services import sending as send_svc
 from shared.enums import CampaignStatus, MailingStatus
 
 pytestmark = pytest.mark.django_db
@@ -149,25 +149,12 @@ class FlakyGmail:
         return R()
 
 
-class DirectApi:
-    """The API surface send_batch uses, wired straight to the services."""
-
-    def __init__(self, campaign, member):
-        self.campaign, self.member = campaign, member
-
-    def claim(self, campaign_id, contact_ids, cc="", bcc=""):
-        claimed, skipped = svc.claim_batch(self.campaign, self.member, contact_ids)
-        return {
-            "claimed": [c.__dict__ for c in claimed],
-            "skipped": [s.__dict__ for s in skipped],
-        }
-
-    def report_sent(self, mailing_id, message_id, thread_id):
-        return svc.record_result(mailing_id, self.member, status="sent",
-                                 message_id=message_id, thread_id=thread_id)
-
-    def report_failed(self, mailing_id, error):
-        return svc.record_result(mailing_id, self.member, status="failed", error=error)
+# NOTE: there used to be a `DirectApi` shim here, standing in for the HTTP
+# surface the laptop agent's send_batch spoke to. The sender now calls
+# claim_batch and record_result in-process, so the shim is gone and these tests
+# exercise the real path with nothing in between. What they assert is unchanged:
+# the incident they encode is about ORDERING and CHUNKING, neither of which
+# moved when the code did.
 
 
 def test_an_interrupted_batch_strands_only_one_chunk(campaign, member):
@@ -181,8 +168,8 @@ def test_an_interrupted_batch_strands_only_one_chunk(campaign, member):
     gmail = FlakyGmail(ok_count=3)
 
     outcomes = list(send_svc.send_batch(
-        DirectApi(campaign, member), gmail, str(campaign.id),
-        [str(c.id) for c in contacts], delay=0, chunk_size=10,
+        member, campaign, [c.id for c in contacts],
+        gmail=gmail, delay=0, chunk_size=10,
     ))
 
     assert len(gmail.sent) == 3
@@ -206,18 +193,21 @@ def test_an_interrupted_batch_strands_only_one_chunk(campaign, member):
 def test_the_whole_batch_is_recoverable_after_an_interruption(campaign, member):
     """After the connection comes back, sending again must actually send."""
     contacts = [make_contact(member, i) for i in range(25)]
-    api = DirectApi(campaign, member)
 
-    list(send_svc.send_batch(api, FlakyGmail(ok_count=3), str(campaign.id),
-                             [str(c.id) for c in contacts], delay=0, chunk_size=10))
+    list(send_svc.send_batch(
+        member, campaign, [c.id for c in contacts],
+        gmail=FlakyGmail(ok_count=3), delay=0, chunk_size=10,
+    ))
 
     # Resolve whatever was left mid-flight, as "Resolve stranded drafts" would.
     for m in CampaignMailing.objects.filter(campaign=campaign, status=MailingStatus.DRAFT.value):
         svc.record_result(m.id, member, status="failed", error="stranded")
 
     healthy = FlakyGmail(ok_count=99)
-    list(send_svc.send_batch(api, healthy, str(campaign.id),
-                             [str(c.id) for c in contacts], delay=0, chunk_size=10))
+    list(send_svc.send_batch(
+        member, campaign, [c.id for c in contacts],
+        gmail=healthy, delay=0, chunk_size=10,
+    ))
 
     sent = CampaignMailing.objects.filter(
         campaign=campaign, status=MailingStatus.SENT.value
@@ -227,18 +217,19 @@ def test_the_whole_batch_is_recoverable_after_an_interruption(campaign, member):
     assert len(healthy.sent) == 22 and len(set(healthy.sent)) == 22
 
 
-def test_a_claim_failure_strands_nothing(campaign, member):
-    """If the CRM is unreachable the chunk was never claimed, so there is
+def test_a_claim_failure_strands_nothing(campaign, member, monkeypatch):
+    """If the database is unreachable the chunk was never claimed, so there is
     nothing to recover -- the run just stops and says so."""
     contacts = [make_contact(member, i) for i in range(5)]
 
-    class DeadApi(DirectApi):
-        def claim(self, *a, **k):
-            raise ConnectionError("[WinError 10053] connection aborted")
+    def dead_claim(*a, **k):
+        raise ConnectionError("[WinError 10053] connection aborted")
+
+    monkeypatch.setattr(send_svc.mailing, "claim_batch", dead_claim)
 
     outcomes = list(send_svc.send_batch(
-        DeadApi(campaign, member), FlakyGmail(99), str(campaign.id),
-        [str(c.id) for c in contacts], delay=0, chunk_size=10,
+        member, campaign, [c.id for c in contacts],
+        gmail=FlakyGmail(99), delay=0, chunk_size=10,
     ))
 
     assert all(o.status == send_svc.FAILED for o in outcomes)

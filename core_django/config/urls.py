@@ -26,6 +26,11 @@ urlpatterns = [
     # outside the crm namespace, because moving it breaks every member's Gmail
     # connection until someone updates the console.
     path("settings/gmail/callback/", auth_views.gmail_callback, name="gmail_callback"),
-    path("api/v1/", include("crm.api.urls")),
+    # NOTE: `/api/v1/` is deliberately gone. It existed so a laptop agent could
+    # claim mailings and lease scheduled sends over HTTP; the server now does
+    # both in-process. Leaving it reachable would be actively dangerous rather
+    # than merely dead: two independent senders could hold the same DRAFT row,
+    # and record_result's "already settled" guard would turn a real double-send
+    # into a silently ignored report.
     path("", include("crm.urls")),
 ]

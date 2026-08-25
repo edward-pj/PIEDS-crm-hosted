@@ -1,0 +1,85 @@
+# Render blueprint. `render.com/deploy` reads this, or paste the values by hand.
+#
+# ONE service, deliberately. The free plan allows 750 instance-hours per
+# workspace per calendar month against a ~730-hour month, so the budget covers
+# exactly one always-awake service. There is no room for a separate worker, and
+# that single fact is why sending runs inside the web process rather than beside
+# it.
+
+services:
+  - type: web
+    name: ignite-crm
+    runtime: docker
+    plan: free
+    region: singapore          # closest to both BITS Pilani and Supabase ap-south
+    dockerfilePath: ./Dockerfile
+
+    # No auth, no database query. See core_django/config/health.py for why the
+    # dullest possible check is the right one, and note that settings.py must
+    # exempt this path from SECURE_SSL_REDIRECT or it answers 301 and every
+    # deploy is marked unhealthy.
+    healthCheckPath: /healthz
+
+    envVars:
+      # --- must be set by hand in the dashboard -------------------------------
+      # Supabase SESSION pooler, port 5432. NOT 6543: the transaction pooler
+      # breaks SELECT ... FOR UPDATE, which claim_batch and assignment depend on.
+      # Include ?sslmode=require.
+      - key: DATABASE_URL
+        sync: false
+
+      # Encrypts every member's Gmail refresh token. Losing it means everyone
+      # reconnects Gmail. Belongs here and NOT in the database -- protecting
+      # against a database leak is the entire point of it.
+      #   python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
+      - key: GMAIL_TOKEN_KEY
+        sync: false
+
+      # Web OAuth client from Google Cloud Console. Authorised redirect URIs
+      # must include BOTH https://<domain>/login/google/callback/ and
+      # https://<domain>/settings/gmail/callback/ -- for every hostname the app
+      # answers on, including the .onrender.com one.
+      - key: GOOGLE_OAUTH_CLIENT_ID
+        sync: false
+      - key: GOOGLE_OAUTH_CLIENT_SECRET
+        sync: false
+
+      # Your hostnames. A leading dot is Django's subdomain wildcard.
+      # e.g. crm.example.com,.onrender.com
+      - key: DJANGO_ALLOWED_HOSTS
+        sync: false
+
+      # --- generated / fixed -------------------------------------------------
+      - key: DJANGO_SECRET_KEY
+        generateValue: true
+
+      # Off, and it has to be. DEBUG=True behind Render's TLS proxy leaves
+      # SECURE_PROXY_SSL_HEADER unset, so request.build_absolute_uri produces an
+      # http:// redirect URI that Google rejects -- which presents as "Google
+      # sign-in is broken" rather than as a settings mistake.
+      - key: DJANGO_DEBUG
+        value: "False"
+
+      - key: GOOGLE_OAUTH_HOSTED_DOMAIN
+        value: pilani.bits-pilani.ac.in
+
+      # NOT OPTIONAL, and the single most likely thing to be forgotten.
+      # docker/entrypoint-crm.sh derives this from whether the database looks
+      # local, reads Supabase as shared, and so SKIPS migrations -- after which
+      # the unconditional check_db fails the boot. That failure is correct
+      # behaviour and will look exactly like a broken deploy.
+      - key: RUN_MIGRATIONS
+        value: "true"
+
+      - key: SEED_DEV
+        value: "false"
+
+      # A pooler has a finite slot count; holding one open per worker per
+      # request cycle exhausts it long before traffic does.
+      - key: DB_CONN_MAX_AGE
+        value: "0"
+
+      # Two workers with threads fits 512 MB. Three does not leave room for the
+      # Google API client, and each holds a pooler slot.
+      - key: WEB_CONCURRENCY
+        value: "2"

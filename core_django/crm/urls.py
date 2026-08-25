@@ -31,6 +31,7 @@ urlpatterns = [
 
     path("schedules/", views.schedule_list, name="schedule_list"),
     path("schedules/<uuid:pk>/cancel/", views.schedule_cancel, name="schedule_cancel"),
+    path("schedules/run/", views.run_queue, name="run_queue"),
 
     path("settings/gmail/", views.gmail_settings, name="gmail_settings"),
     path("settings/gmail/connect/", views.gmail_connect, name="gmail_connect"),
@@ -44,6 +45,4 @@ urlpatterns = [
 
     path("members/", views.member_list, name="member_list"),
     path("members/<uuid:pk>/sender-name/", views.member_sender_name, name="member_sender_name"),
-    path("members/tokens/issue/", views.token_issue, name="token_issue"),
-    path("members/tokens/<uuid:pk>/revoke/", views.token_revoke, name="token_revoke"),
 ]

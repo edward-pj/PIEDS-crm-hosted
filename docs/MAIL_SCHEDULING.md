@@ -36,7 +36,7 @@ the scheduled moment and holds that member's Gmail OAuth token**.
 > preserved because the *constraint* has not changed — Gmail still has no `sendAt` — but the answer
 > has. **The server now holds encrypted per-member refresh tokens and sends directly**
 > (`crm/services/gmail.py`, `crm/services/sending.py`, `crm/services/runner.py`), and
-> `local_agent/` is being retired.
+> `local_agent/` has been deleted.
 >
 > The argument below — that the CRM *cannot* be that process, because the server never holds Gmail
 > credentials — was correct and load-bearing at the time. It was given up deliberately, not
@@ -71,40 +71,83 @@ and fifth are now about how the server sends, not whether it does.*
 ## 2. Architecture
 
 ```
-  ┌──────────────┐   POST /schedules            ┌──────────────────┐
-  │ member's     │ ───────────────────────────▶ │  Django CRM      │
-  │ laptop agent │                              │  (Supabase)      │
-  └──────────────┘                              │                  │
-                                                │  scheduled_sends │
-  ┌──────────────┐   POST /schedules/claim      │                  │
-  │ always-on    │ ◀──── leases due jobs ─────▶ │  campaign_mailings
-  │ agent        │       every 60s              └──────────────────┘
-  │ (Docker)     │
-  └──────┬───────┘
-         │ Gmail API (that member's token)
-         ▼
-     recipients
+  ┌──────────────┐   press Send / Schedule      ┌────────────────────┐
+  │  a member's  │ ───────────────────────────▶ │  Django CRM        │
+  │   browser    │                              │  (Render, one      │
+  └──────────────┘                              │   Docker service)  │
+                                                │                    │
+  ┌──────────────┐   "Send queued mail now"     │  scheduled_sends   │
+  │  a lead's    │ ───────────────────────────▶ │  campaign_mailings │
+  │   browser    │        (or manage.py         │  gmail_credentials │
+  └──────────────┘         run_tick)            └─────────┬──────────┘
+                                                          │
+                                       services/runner.py::tick()
+                                                          │
+                                       Gmail API, per member's own token
+                                                          ▼
+                                                     recipients
 ```
 
-The always-on agent is the existing `agent` service in `docker-compose.yml` (profile `agent`),
-which already mounts a token directory and refuses to start unless its API token's owner matches
-its Gmail account. Phase 1 gives it a background poller; nothing about its identity model changes.
+**One process does everything.** There is no agent, no second app, and nothing
+to keep running on anyone's laptop. `services/runner.py::tick()` is the executor:
+it sweeps expired leases, sweeps missed jobs, runs the reply scan, runs the
+follow-up rules, then for each member with a usable Gmail credential calls
+`scheduling.claim_due(member, …)` and sends what it leased.
 
-### One agent, one member
+### Pressing Send does not send
 
-`AGENT_API_TOKEN` identifies exactly one `TeamMember`, and `local_agent/main.py`'s lifespan aborts
-startup if the Gmail session disagrees with it. An agent may therefore only execute schedules
-belonging to **its own member** — anything else would put a mail in a prospect's inbox from the
-wrong mailbox and record a false `sent_by`.
+It commits a `ScheduledSend` due now and returns. This is deliberate: a free
+Render instance can be reaped mid-request, and gunicorn workers are scarce, so
+streaming a 200-mail batch inside one HTTP response makes "the tab was closed" a
+data-integrity question. Queueing makes it a non-event, and it means an
+immediate send reuses the lease, drip, grace and recovery machinery that
+scheduled sends already had rather than growing a second execution path.
 
-Consequences to be honest about:
+### Still one member per job
 
-- One always-on agent gives reliable scheduling for **one account**.
-- To cover several members, run one container per member, each with its own `AGENT_API_TOKEN` and
-  `AGENT_TOKEN_DIR`. See the [runbook](#13-runbook).
-- A member with no always-on agent can still schedule; their job simply waits for their laptop
-  agent, subject to the grace window (§5). This is a real limitation, not a bug, and the CRM
-  surfaces it (Phase 2).
+`claim_due(member, …)` keeps its per-member signature even though the server now
+holds every credential and could widen the query. The `member` filter is what
+guarantees a job sends from the mailbox it was queued against; `sent_by` stops
+meaning anything without it. The tick loops over members instead.
+
+### What is not built yet
+
+`tick()` has two doors today — the lead-only **Send queued mail now** button on
+`/schedules/`, and `manage.py run_tick`. Both are manual. **Nothing runs it on a
+timer**, so a due job waits until a human presses something.
+
+Closing that is a deliberately small, deliberately deferred piece of work:
+
+| Piece | Why |
+|---|---|
+| `GET /internal/tick`, authenticated with `secrets.compare_digest` against `TICK_SECRET` | the pinger is not a team member, so a shared secret rather than a session or a token row |
+| session-level `pg_try_advisory_lock` around the call, released in a `finally` | two pings landing on two gunicorn workers means two ticks, and workers share no memory |
+| an external pinger every 1–2 minutes | Render's free plan has **no cron**, and a self-ping cannot wake an instance that is already asleep |
+
+Three things to know before building it:
+
+- **Session-level, not `pg_try_advisory_xact_lock`.** The transactional variant
+  needs the whole tick inside one transaction, which is impossible: `claim_batch`
+  commits **per contact** on purpose, so that a crash can never leave a sent mail
+  with no record. Never wrap `tick()` in `@transaction.atomic`.
+- **Advisory locks are broken on Supabase's transaction pooler (:6543)** — a
+  session lock taken on one pooled backend is invisible to the next statement,
+  with no error, so two ticks simply run at once. `check_db` already refuses port
+  6543 for `SELECT … FOR UPDATE`; that check protects the scheduler too.
+- **The ping interval is a throughput setting.** A tick is capped at
+  `TICK_MAX_MAILS` (40), so 1 minute is ~2,000 mails/hour team-wide and 10
+  minutes is ~240. Ten minutes is what you would pick thinking only about
+  keep-alive, and it would quietly turn a launch blast into most of a day.
+
+An in-process thread from `AppConfig.ready()` was considered and **rejected**:
+`ready()` runs in every gunicorn worker (so, several schedulers racing), and also
+under `migrate`, `collectstatic`, `shell` and **pytest** — a live scheduler
+inside the test suite, avoidable only by sniffing `sys.argv`. It holds a pooler
+connection permanently against a deliberate `CONN_MAX_AGE=0`. And it does not
+even solve the problem: the instance sleeps after 15 minutes of no requests and
+the thread dies with it, so it only runs when something external is already
+keeping the service awake. On a platform where only a request can wake the
+process, a request-driven design is the only honest one.
 
 ---
 
@@ -129,7 +172,7 @@ requires that these strings never drift.
 ```
 
 - **PENDING** — scheduled, not yet due, or bounced back by a lease sweep.
-- **RUNNING** — leased by an agent this minute. Not a promise it will finish.
+- **RUNNING** — leased by a tick this minute. Not a promise it will finish.
 - **HELD** — due, but not allowed to run: the campaign left `active`, or we are inside quiet hours.
   Re-evaluated every tick.
 - **DONE** — every contact in the job was resolved: sent, or permanently skipped.
@@ -142,25 +185,32 @@ requires that these strings never drift.
 
 ## 4. The lease protocol
 
-Two agents authenticated as the same member (a laptop and the always-on one) can poll at the same
-instant. Claiming is one transaction, mirroring `claim_batch` in `services/mailing.py`:
+Two ticks can overlap — two gunicorn workers, or a lead pressing the button while `run_tick`
+is running. Claiming is one transaction, mirroring `claim_batch` in `services/mailing.py`:
 
 ```sql
 SELECT * FROM scheduled_sends
  WHERE status = 'pending' AND member_id = :me AND scheduled_at <= :now
  FOR UPDATE SKIP LOCKED;
 -- then, in the same transaction:
-UPDATE ... SET status='running', leased_by=:agent, lease_expires_at = :now + interval '5 minutes';
+UPDATE ... SET status='running', leased_by=:runner, lease_expires_at = :now + interval '5 minutes';
 ```
 
-`SKIP LOCKED` means a second poller sees nothing rather than blocking. While a batch runs the agent
-heartbeats to extend the lease; if it dies, the lease expires and a sweep returns the job to
+`SKIP LOCKED` means a second tick takes different jobs rather than blocking. While a batch runs
+the lease is extended; if the process dies, the lease expires and a sweep returns the job to
 `PENDING`, exactly as `stranded_drafts` recovers a half-sent batch today.
 
-**The lease is a scheduling optimisation, never the safety mechanism.** Even if two agents somehow
-executed the same job, `UniqueConstraint(campaign, contact)` still makes a second mail to the same
-prospect impossible. That constraint remains the only thing standing between us and a duplicate
-send, and nothing here is allowed to weaken it.
+**The lease is a scheduling optimisation, never the safety mechanism.** Even if two runners somehow
+executed the same job, `uniq_root_campaign_contact` still makes a second mail to the same prospect
+impossible — and it is now team-wide, not per campaign, so it also covers two *different* members'
+sub-campaigns under one root. That constraint remains the only thing standing between us and a
+duplicate send, and nothing here is allowed to weaken it.
+
+> **When the scheduler lands, the 5-minute lease becomes wrong.** With ticks minutes apart, every
+> RUNNING job's lease expires between them and the sweep requeues jobs that were never stranded.
+> Fix the meaning rather than the number: a tick must **always resolve every job it leases before
+> returning**, so "RUNNING at the start of a tick" means precisely "the previous tick died
+> mid-slice" — which is what the sweep is for. Then drop `LEASE_MINUTES` to 2.
 
 ---
 
@@ -199,14 +249,14 @@ All of this lives in `services/scheduling.py` and takes `now` as a parameter (de
 
 ## ✅ Phase 1 — one-off scheduled sends
 
-The MVP: pick contacts, press **Schedule…**, choose a time, and the always-on agent sends it then.
+The MVP: pick contacts, press **Schedule…**, choose a time, and the next tick after that time sends it.
 
 **Model** — `ScheduledSend(TimeStampedModel)`, `db_table = "scheduled_sends"`:
 
 | Field | Notes |
 |---|---|
 | `campaign` | FK `PROTECT` |
-| `member` | FK `PROTECT` — whose Gmail sends it, and the only agent allowed to execute it |
+| `member` | FK `PROTECT` — whose Gmail sends it; `claim_due` is per member, so nothing else can |
 | `created_by` | FK `SET_NULL` |
 | `contact_ids` | `ArrayField(UUIDField())` — snapshot of the selection |
 | `cursor` | index of the next contact to attempt |
@@ -257,8 +307,9 @@ Per job: `batch_size`, `interval_minutes`, optional `per_day`, optional jitter s
 machine-regular. Each tick takes `contact_ids[cursor : cursor + batch_size]` and advances.
 
 Two existing limits stay authoritative and are never overridden: `DAILY_SEND_CAP = 400`, enforced
-server-side across every device a member uses, and `AGENT_SEND_DELAY_SECONDS` for intra-batch
-pacing. A drip that hits the cap parks until the 24-hour window rolls, exactly as `claim_batch`
+server-side and counted across everything a member sends, and `GMAIL_SEND_DELAY_SECONDS` for
+intra-batch pacing (now `0.0` by default — the old 2-second pause existed for a laptop sitting in a
+loop, and inside a bounded tick it only burns budget). A drip that hits the cap parks until the 24-hour window rolls, exactly as `claim_batch`
 already reports `CAP_REACHED`.
 
 ## ✅ Phase 5 — follow-up sequences
@@ -266,9 +317,10 @@ already reports `CAP_REACHED`.
 `FollowUpRule`: parent campaign → follow-up campaign, `delay_days`, condition `no_reply`.
 
 Reply detection reuses what exists: `CampaignMailing.mail_thread_id` is captured on every send, and
-`GmailClient` already holds `gmail.readonly` and already queries Gmail during `reconcile`. A new
-agent job fetches each thread and asks whether it contains a message from the contact after
-`sent_at`. A reply cancels pending follow-ups; silence past `delay_days` creates a `ScheduledSend`
+`GmailClient` already holds `gmail.readonly` and already queries Gmail during `reconcile`. The
+reply scan at the top of each tick fetches each thread and asks whether it contains a message from
+the contact after `sent_at`. It runs **before** claiming, deliberately: a reply seen now pulls that
+contact out of a follow-up going out this very tick. A reply cancels pending follow-ups; silence past `delay_days` creates a `ScheduledSend`
 for the follow-up campaign, and everything downstream is Phase 1 machinery.
 
 ⚠️ **This touches a deliberate invariant.** `shared/enums.py` states that NEW→CONTACTED is the
@@ -289,93 +341,95 @@ Settings reference:
 | `SCHEDULE_WINDOW_START` / `_END` | `9` / `19` | Delivery window, in `TIME_ZONE`. Equal values disable it. |
 | `SCHEDULE_WINDOW_DAYS` | `0,1,2,3,4,5,6` | Weekdays mail may go out; Monday is 0. |
 | `SCHEDULE_GRACE_HOURS` | `6` | How late a job may still send before it is `missed`. |
-| `AGENT_SCHEDULE_POLL_SECONDS` | `60` | How often an agent asks for due work. |
-| `AGENT_SCHEDULE_CLAIM_LIMIT` | `5` | Jobs leased per tick. |
-| `AGENT_ID` | hostname:pid | Who holds a lease, for humans reading the CRM. |
+| `GMAIL_SEND_DELAY_SECONDS` | `0.0` | Pause between messages inside one batch. |
+
+And, as module constants rather than env vars, because changing them is a decision and not a knob:
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `runner.CLAIM_LIMIT` | `5` | Jobs leased per member per tick. |
+| `runner.TICK_MAX_MAILS` | `40` | Hard cap on one tick, so it fits inside a request. |
+| `runner.TICK_MAX_SECONDS` | `45` | Wall-clock cap on one tick, same reason. |
+| `scheduling.LEASE_MINUTES` | `5` | How long a lease survives before a sweep reclaims it. |
+| `sending.CLAIM_CHUNK` | `10` | Contacts claimed at once — see the 19 Aug incident, README §7. |
 
 ---
 
 ## 13. Runbook
 
-### Starting the always-on agent
+### Making queued mail go out
+
+Nothing is on a timer (§2). Two doors, one code path:
+
+| | |
+|---|---|
+| **Send queued mail now** on `/schedules/` | lead-only, POST — what the team uses |
+| `manage.py run_tick` | the same function from a shell, for local work |
 
 ```bash
-# once: issue that member a token and grant Gmail consent on this host
-docker compose exec crm python core_django/manage.py issue_token \
-    kabir@pilani.bits-pilani.ac.in --label always-on
-
-# then, with AGENT_API_TOKEN and AGENT_MEMBER_EMAIL in .env
-docker compose --profile agent up -d
-docker compose logs -f agent
+cd core_django && ../.venv/bin/python manage.py run_tick
 ```
 
-Within a minute the log says:
+It prints what it did: leases taken, mails sent, jobs finished, jobs held. A
+tick is bounded by `TICK_MAX_MAILS` (40) and `TICK_MAX_SECONDS` (45) so it fits
+inside a request — press it again for more.
 
-```
-scheduler polling every 60s as <hostname>:<pid>
-```
+**Render's free tier has no shell.** On the deployed instance the button is the
+only way, which is why it exists at all rather than waiting for the scheduler.
 
-If it does not, nothing is scheduled — that line is the whole feature working.
-`GET /health` on port 8111 answers even when the poller is wedged, so check the log, not the port.
+It is safe to run two at once: `claim_due` uses `SELECT … FOR UPDATE SKIP
+LOCKED`, so the second tick takes different jobs, and `uniq_root_campaign_contact`
+is the real guarantee underneath regardless. The advisory lock in §2 is about
+not wasting work, not about correctness of the mail itself.
 
-### One agent per member
+### Everyone connects their own Gmail
 
-An agent may only execute schedules for the member its token belongs to (§2). To cover several
-people, run one container each — same image, different token and token directory:
-
-```yaml
-  agent-kabir:
-    extends: { service: agent }
-    container_name: ignite_agent_kabir
-    environment:
-      AGENT_API_TOKEN: ${KABIR_AGENT_TOKEN}
-      AGENT_MEMBER_EMAIL: kabir@pilani.bits-pilani.ac.in
-    volumes: [ "~/.ignite_crm/kabir:/tokens" ]
-    ports: [ "8112:8111" ]
-```
-
-Each needs its own Gmail consent granted once on that host, and its own port.
+A member with no usable `GmailCredential` is skipped by the tick entirely — their
+jobs sit `pending` until they connect. `sendable_members()` is the filter, and
+`/settings/gmail/` is where they fix it. This is the most likely reason one
+person's scheduled mail did not move while everyone else's did.
 
 ### What `missed` means
 
-Nothing was awake to run the job before its grace window closed (§5). The mail **did not go out**.
-The `/schedules/` page lists these above the table for exactly this reason.
+Nothing ran the job before its grace window closed (§5). The mail **did not go
+out**. The `/schedules/` page lists these above the table for exactly this
+reason.
 
-To send it after all: open the job, confirm the campaign is still `active` and the content still
-makes sense, then queue a fresh schedule for the same contacts. A `missed` job is terminal on
-purpose — silently reviving one hours later is how a prospect gets a mail about an event that has
-already happened.
+To send it after all: open the job, confirm the campaign is still `active` and
+the content still makes sense, then queue a fresh schedule for the same contacts.
+A `missed` job is terminal on purpose — silently reviving one hours later is how
+a prospect gets a mail about an event that has already happened.
 
 ### Draining the queue before a deploy
 
 ```bash
 # what is still outstanding
-docker compose exec crm python core_django/manage.py shell -c \
+cd core_django && ../.venv/bin/python manage.py shell -c \
   "from crm.models import ScheduledSend; from shared.enums import TERMINAL_SCHEDULE_STATUSES; \
    print(ScheduledSend.objects.exclude(status__in=TERMINAL_SCHEDULE_STATUSES).count())"
 ```
 
-A restart mid-batch is safe: the lease expires, the job returns to `PENDING`, and the unique
-constraint means the contacts already done are skipped. The only cost is up to five minutes of
-delay. There is no need to drain anything — but knowing the number tells you what to expect in the
-logs afterwards.
-
-### After a code change
-
-**The agent does not hot-reload.** `docker compose up -d --build agent`, or restart the host
-process. A change to `local_agent/` with no restart looks exactly like a broken feature, and has
-already once been mistaken for one.
+A restart mid-tick is safe: the lease expires, the job returns to `PENDING`, and
+the unique constraint means contacts already done are skipped. The only cost is
+delay. There is nothing you *must* drain — but knowing the number tells you what
+to expect afterwards.
 
 ### When a scheduled send did not arrive
 
 In order of likelihood:
 
-1. **No agent was running** for that member → the job is `missed` or still `pending`. The log is
-   the proof; `/schedules/` is the summary.
-2. **Outside the sending window** → status is `held`, and `last_error` names the window and the
-   time it will be released.
-3. **Campaign was paused** → `held`, then `missed` at the deadline. Pausing is the emergency brake
-   and it is doing its job.
-4. **Daily cap spent** → the scheduler stands down entirely until the 24-hour window rolls.
-5. **The contact was skipped** → `skipped_count` moved, not `sent_count`. Reasons are the ordinary
-   ones: reassigned, archived, `do_not_contact`, already mailed for that campaign.
+1. **Nobody ran a tick.** The job is still `pending`, or `missed` if its grace
+   window closed. This is the common one until the scheduler lands, and it is the
+   first thing to check.
+2. **That member has not connected Gmail** → skipped by `sendable_members()`,
+   job stays `pending`.
+3. **Outside the sending window** → status is `held`, and `last_error` names the
+   window and the time it will be released.
+4. **Campaign was paused** → `held`, then `missed` at the deadline. Note that
+   pausing the **root** pauses every sub-campaign under it; that is the emergency
+   brake doing its job.
+5. **Daily cap spent** → that member stands down entirely until the 24-hour
+   window rolls.
+6. **The contact was skipped** → `skipped_count` moved, not `sent_count`. Reasons
+   are the ordinary ones: reassigned, archived, `do_not_contact`, or already
+   mailed by a teammate under that root campaign.

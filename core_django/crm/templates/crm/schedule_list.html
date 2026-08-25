@@ -2,7 +2,30 @@
 {% block title %}Scheduled sends — Ignite CRM{% endblock %}
 {% block heading %}Scheduled sends{% endblock %}
 
+{% block actions %}
+  {% if is_lead %}
+    <form method="post" action="{% url 'crm:run_queue' %}">
+      {% csrf_token %}
+      <button type="submit" class="btn btn-sm">Send queued mail now</button>
+    </form>
+  {% endif %}
+{% endblock %}
+
 {% block content %}
+
+{% if is_lead %}
+  <div class="alert mb-3">
+    <section>
+      <p class="text-sm">
+        <strong>Queued mail does not send on its own yet.</strong> Press
+        <em>Send queued mail now</em> above to work through everything due.
+        The automatic scheduler is not deployed; until it is, this button is how
+        mail leaves the building.
+      </p>
+    </section>
+  </div>
+{% endif %}
+
 {# Attention first. A job nothing executed is the failure mode this whole page
    exists for, and burying it under a paginated table would defeat the point. #}
 {% if needs_attention %}

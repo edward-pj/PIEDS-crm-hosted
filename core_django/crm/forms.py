@@ -257,12 +257,3 @@ class CsvUploadForm(forms.Form):
     )
 
 
-class TokenForm(BasecoatMixin, forms.Form):
-    member = forms.ModelChoiceField(queryset=None, label="Team member")
-    label = forms.CharField(required=False, label="Label",
-                            widget=forms.TextInput(attrs={"placeholder": "e.g. Aarav's MacBook"}))
-
-    def __init__(self, *args, **kwargs):
-        members = kwargs.pop("members")
-        super().__init__(*args, **kwargs)
-        self.fields["member"].queryset = members

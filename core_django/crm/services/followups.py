@@ -19,6 +19,7 @@ setting REPLIED stays opt-in per rule (FollowUpRule.mark_replied).
 
 from datetime import timedelta
 
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
@@ -83,7 +84,7 @@ def record_reply_scan(mailing_id, member, *, replied: bool, now=None) -> dict:
         mailing = CampaignMailing.objects.select_for_update().select_related(
             "contact", "campaign"
         ).get(id=mailing_id, sent_by=member)
-    except (CampaignMailing.DoesNotExist, ValueError, TypeError):
+    except (CampaignMailing.DoesNotExist, DjangoValidationError, ValueError, TypeError):
         return {"status": "unknown"}
 
     mailing.reply_checked_at = now

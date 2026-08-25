@@ -25,10 +25,8 @@ from .forms import (
     CsvUploadForm,
     FooterForm,
     NoteForm,
-    TokenForm,
 )
 from .models import (
-    ApiToken,
     Campaign,
     CampaignMailing,
     Contact,
@@ -39,6 +37,7 @@ from .models import (
 from .services import assignment, importer
 from .services import mailing
 from .services import gmail as gmail_svc
+from .services import runner
 from .services import gmail_oauth
 from .services import secrets as token_store
 from .services import permissions
@@ -624,11 +623,16 @@ def schedule_cancel(request, pk):
     return redirect("crm:schedule_list")
 
 
-# ------------------------------------------------------------ team & tokens
+# ------------------------------------------------------------------ members
 
 @lead_required
 def member_list(request):
-    form = TokenForm(members=TeamMember.objects.filter(is_active=True))
+    """Who is on the team, what they are carrying, and whether they can send.
+
+    The API-token half of this page is gone with the agent it existed for. A
+    lead handing out a token that reaches nothing is worse than no button, and
+    a token surface with no consumer is attack surface with no upside.
+    """
     return render(request, "crm/member_list.html", _base(
         request,
         members=TeamMember.objects.annotate(
@@ -636,9 +640,6 @@ def member_list(request):
             sent=Count("mailings", filter=Q(mailings__status=MailingStatus.SENT.value),
                        distinct=True),
         ),
-        tokens=ApiToken.objects.select_related("member"),
-        form=form,
-        new_token=request.session.pop("new_token", None),
     ))
 
 
@@ -657,30 +658,6 @@ def member_sender_name(request, pk):
     messages.success(
         request, f"{member.name} now sends as “{member.display_name}”."
     )
-    return redirect("crm:member_list")
-
-
-@lead_required
-@require_POST
-def token_issue(request):
-    form = TokenForm(request.POST, members=TeamMember.objects.filter(is_active=True))
-    if not form.is_valid():
-        messages.error(request, "Pick a team member.")
-        return redirect("crm:member_list")
-
-    _, raw = ApiToken.issue(form.cleaned_data["member"], form.cleaned_data["label"])
-    # Shown exactly once -- only the hash is stored.
-    request.session["new_token"] = raw
-    messages.success(request, "Token created. Copy it now — it cannot be shown again.")
-    return redirect("crm:member_list")
-
-
-@lead_required
-@require_POST
-def token_revoke(request, pk):
-    token = get_object_or_404(ApiToken, pk=pk)
-    token.revoke()
-    messages.success(request, f"Revoked token {token.key_prefix}… for {token.member.name}.")
     return redirect("crm:member_list")
 
 
@@ -1002,3 +979,44 @@ def team_distribute(request, pk):
         ),
         pool_size=qs.count(),
     ))
+
+
+@lead_required
+@require_POST
+def run_queue(request):
+    """Drain the queued sends now, from the browser.
+
+    **This is a stand-in for the scheduler, not the scheduler.** The hosted plan
+    has no shell, so `manage.py run_tick` cannot be run on the deployed instance
+    at all — without this button, queued mail would have no way to leave the
+    building. When the tick endpoint and an external pinger land, this stays as
+    the manual override.
+
+    Safe to press twice, and safe for two leads to press at once, which is why
+    it needs no lock: `claim_due` leases with `select_for_update(skip_locked)`
+    so a second run sees nothing rather than blocking, and even if both somehow
+    reached the same job, `uniq_root_campaign_contact` still stands between them
+    and a prospect's inbox. The lease is a scheduling convenience; the
+    constraint is the guarantee.
+
+    Bounded by TICK_MAX_SECONDS so it cannot hold a worker indefinitely. If it
+    stops on budget it says so, and pressing again continues from the cursor.
+    """
+    report = runner.tick()
+
+    if report.jobs == 0:
+        messages.info(request, "Nothing was due to send.")
+    else:
+        messages.success(
+            request,
+            f"Sent {report.sent}, skipped {report.skipped}, across "
+            f"{report.jobs} job(s).",
+        )
+    if report.stopped_early:
+        messages.info(
+            request, "Stopped on the time budget — press again to continue."
+        )
+    for error in report.errors[:3]:
+        messages.error(request, error)
+
+    return redirect("crm:schedule_list")

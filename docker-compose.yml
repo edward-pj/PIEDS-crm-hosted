@@ -54,6 +54,10 @@ services:
       GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:-}
       GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:-}
       GOOGLE_OAUTH_HOSTED_DOMAIN: ${GOOGLE_OAUTH_HOSTED_DOMAIN:-pilani.bits-pilani.ac.in}
+      # The server holds each member's Gmail refresh token, encrypted with
+      # this. Without it check_db fails the boot -- deliberately, because a CRM
+      # that starts and then cannot send is worse than one that will not start.
+      GMAIL_TOKEN_KEY: ${GMAIL_TOKEN_KEY:-}
       DB_CONN_MAX_AGE: ${DB_CONN_MAX_AGE:-0}
       DB_TRANSACTION_POOLER: ${DB_TRANSACTION_POOLER:-False}
       # Both default to "whether DATABASE_URL is a local database" -- see the
@@ -67,40 +71,6 @@ services:
     # (see Dockerfile), so compose and the hosting platform start the container
     # identically -- which is the only way "it works in compose" means anything.
     # Overriding `entrypoint:` here would silently blank `command:` as well.
-
-  # The sending agent. Opt-in: `docker compose --profile agent up`.
-  # It needs an API token that only exists once the CRM is running, and a Gmail
-  # consent that has to happen in a real browser -- see README section 13.1.
-  agent:
-    profiles: ["agent"]
-    image: ignite-crm
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: ignite_crm_agent
-    depends_on:
-      - crm
-    environment:
-      # Deliberately no DATABASE_URL. The agent has no database access; that is
-      # the security model, not an oversight.
-      AGENT_API_BASE_URL: http://crm:8000
-      AGENT_API_TOKEN: ${AGENT_API_TOKEN:-}
-      AGENT_MEMBER_EMAIL: ${AGENT_MEMBER_EMAIL:-}
-      AGENT_SEND_DELAY_SECONDS: ${AGENT_SEND_DELAY_SECONDS:-2}
-      # Both live in the mounted token dir. Bind-mounting the single JSON file
-      # instead would make Docker silently create a *directory* named
-      # client_secret.json in the repo whenever the file is missing.
-      GOOGLE_CLIENT_SECRETS_PATH: /tokens/client_secret.json
-      AGENT_TOKEN_DIR: /tokens
-    volumes:
-      # Cached Gmail tokens, shared with a host-side agent run: consent granted
-      # once on the host is reused here. Copy client_secret.json in beside them.
-      - ${AGENT_TOKEN_DIR_HOST:-~/.ignite_crm}:/tokens
-    ports:
-      - "8111:8111"
-    entrypoint: ["./docker/entrypoint-agent.sh"]
-    command:
-      ["uvicorn", "local_agent.main:app", "--host", "0.0.0.0", "--port", "8111"]
 
 volumes:
   ignite_pgdata:

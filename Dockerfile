@@ -1,11 +1,9 @@
-# One image, both apps.
+# The CRM image.
 #
-# core_django and local_agent share `shared/` and are pinned to the same Python
-# and the same dependency set, so building them twice buys nothing. The image
-# ships both; docker-compose picks which one a container runs by choosing an
-# entrypoint. The security split the README describes is enforced by which
-# environment variables each container gets, not by which files it has:
-# the agent container is never given DATABASE_URL.
+# This used to ship two apps -- core_django and a FastAPI sending agent that ran
+# on each member's laptop -- and compose picked between them with an entrypoint.
+# The agent is gone: sending moved server-side (crm/services/gmail.py), which is
+# what made hosting possible at all.
 FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -26,7 +24,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY shared/ ./shared/
 COPY core_django/ ./core_django/
-COPY local_agent/ ./local_agent/
 COPY conftest.py pytest.ini ./
 COPY docker/ ./docker/
 RUN chmod +x ./docker/*.sh
@@ -51,7 +48,7 @@ RUN DJANGO_DEBUG=False \
 RUN useradd --create-home --uid 10001 appuser
 USER appuser
 
-EXPOSE 8000 8111
+EXPOSE 8000
 
 # The full argv lives in the image, not only in docker-compose.yml -- `docker run
 # ignite-crm` used to exec the entrypoint with no arguments, so its final
