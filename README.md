@@ -579,12 +579,21 @@ what guarantees a job sends from the mailbox it was queued against, and `sent_by
 stops meaning anything without it. The tick loops over members rather than
 widening that query.
 
+> **The sending window ships disabled.** `SCHEDULE_WINDOW_START == _END == 0`,
+> so mail goes out whenever it is queued, at any hour. It defaulted to
+> 09:00–19:00 and that surprised people: a send pressed at 20:00 went `HELD`
+> rather than out, which reads as "the button did nothing". The machinery is
+> intact — set `SCHEDULE_WINDOW_START=9` and `SCHEDULE_WINDOW_END=19` to turn it
+> back on, which is worth doing before the first large campaign to real
+> prospects.
+
 > **Read this before queueing anything.** `tick()` is not yet on a timer. A due
 > job waits until someone runs it — the **Send queued mail now** button on the
 > Schedules page, or `manage.py run_tick`. See [§13.3](#133-draining-the-send-queue),
 > and [§23](#23-known-gaps) for what is left to make it hands-off.
 
-Everything else is built on that: a **sending window** so nothing arrives at 3am,
+Everything else is built on that: a **sending window** so nothing arrives at 3am
+(shipped **off** — see below),
 a **grace period** after which a job is `missed` rather than stale, **drip** to
 spread a batch, and **follow-ups** that chase silence using the Gmail thread the
 original mail created.
@@ -1106,7 +1115,7 @@ ignite: tests pinned to localhost:5432/ignite_crm (never the hosted database)
 ```
 
 Verified by running the suite with `DATABASE_URL` pointed at a fake Supabase
-host: all 310 tests still pass against localhost.
+host: all 311 tests still pass against localhost.
 
 ---
 
@@ -1277,11 +1286,11 @@ designed but not deployed; see `docs/MAIL_SCHEDULING.md`. The ping interval is a
 .venv/bin/python -m pytest          # needs docker compose up
 ```
 
-**310 tests**, all passing:
+**311 tests**, all passing:
 
 | File | Count | Covers |
 |---|---|---|
-| `test_scheduling.py` | 48 | the queue, the lease, the sending window, grace, drip, `tick()` |
+| `test_scheduling.py` | 49 | the queue, the lease, the sending window, grace, drip, `tick()` |
 | `test_teams.py` | 36 | join codes, roles, `assignable_members`, distribution, audit |
 | `test_campaign_hierarchy.py` | 36 | roots and sub-campaigns, footers, root-scoped dedupe |
 | `test_contacts_crud.py` | 32 | edit scoping, lifecycle rules, archive/delete, audit, HTTP layer |
@@ -1487,7 +1496,7 @@ ignite_crm/
 │       │                          seed_dev.py, stranded_drafts.py
 │       ├── migrations/            0001 … 0015_revoke_api_tokens
 │       ├── templates/crm/         22 templates
-│       └── tests/                 310 tests, incl. conftest.py
+│       └── tests/                 311 tests, incl. conftest.py
 │
 └── render.yaml                    the hosting blueprint
 ```

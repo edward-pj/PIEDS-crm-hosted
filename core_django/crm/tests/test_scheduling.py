@@ -38,10 +38,11 @@ pytestmark = pytest.mark.django_db
 def _window_off_by_default(settings):
     """Most tests here are about the queue, not the clock.
 
-    Leaving the real 09:00-19:00 default in place would make them pass or fail
-    depending on what time of day the suite happens to run -- which is exactly
-    the kind of test that erodes trust in a suite. Tests that are ABOUT the
-    window ask for the `window` fixture and get it back.
+    This now matches the shipped default rather than overriding it -- the
+    window ships OFF (settings.py) -- but the fixture stays: it makes these
+    tests independent of what the deployment happens to be configured with, and
+    of what time of day the suite runs. Tests that are ABOUT the window ask for
+    the `window` fixture and get one.
     """
     settings.SCHEDULE_WINDOW_START = 0
     settings.SCHEDULE_WINDOW_END = 0
@@ -51,7 +52,13 @@ def _window_off_by_default(settings):
 
 @pytest.fixture
 def window(settings):
-    """The real defaults: 09:00-19:00 every day, six hours of grace."""
+    """A 09:00-19:00 window, every day, six hours of grace.
+
+    No longer the shipped default -- the window is OFF out of the box (see
+    settings.py) -- so these tests turn it on deliberately. The machinery is
+    kept working precisely so it can be switched back on before a large
+    campaign, which is what these tests defend.
+    """
     settings.SCHEDULE_WINDOW_START = 9
     settings.SCHEDULE_WINDOW_END = 19
     settings.SCHEDULE_WINDOW_DAYS = [0, 1, 2, 3, 4, 5, 6]
@@ -603,6 +610,26 @@ def test_a_closed_weekend_pushes_to_monday(window):
 def test_an_equal_start_and_end_disables_the_window():
     """The autouse fixture already disables it; this pins the behaviour."""
     assert svc.in_window(at(3, 0)) is True
+    assert svc.next_open_slot(at(3, 0)) == at(3, 0)
+
+
+def test_no_configured_window_means_send_at_any_hour(settings):
+    """With the settings absent entirely, the fallback must be "no window".
+
+    Deliberately asserted on behaviour rather than on the numbers in
+    settings.py: that module reads .env, so a test comparing its values would
+    pass or fail depending on the developer's own environment -- the exact
+    flakiness the autouse fixture above exists to prevent.
+
+    What this pins is the fallback in `_window()`. If it ever goes back to
+    (9, 19), a send pressed at 20:00 reports success and then quietly sits HELD
+    until morning, which reads as "the button did nothing".
+    """
+    del settings.SCHEDULE_WINDOW_START
+    del settings.SCHEDULE_WINDOW_END
+
+    assert svc.in_window(at(3, 0)) is True
+    assert svc.in_window(at(23, 59)) is True
     assert svc.next_open_slot(at(3, 0)) == at(3, 0)
 
 

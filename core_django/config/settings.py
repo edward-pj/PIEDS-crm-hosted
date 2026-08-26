@@ -182,15 +182,25 @@ LOGIN_REDIRECT_URL = "/"
 LOGOUT_REDIRECT_URL = "/login/"
 
 # --- scheduled sending ----------------------------------------------------
-# Gmail has no sendAt, so a scheduled mail goes out only when an agent is awake
-# to send it. These two settings decide what "on time" means. See
+# Gmail has no sendAt, so a scheduled mail goes out only when a tick runs to
+# send it. These settings decide what "on time" means. See
 # docs/MAIL_SCHEDULING.md.
 
 #: Delivery window, in TIME_ZONE. A job falling due outside it waits for the
 #: next open slot rather than mailing a prospect at three in the morning.
-#: Set SCHEDULE_QUIET_START == SCHEDULE_QUIET_END to disable the window.
-SCHEDULE_WINDOW_START = env.int("SCHEDULE_WINDOW_START", default=9)
-SCHEDULE_WINDOW_END = env.int("SCHEDULE_WINDOW_END", default=19)
+#:
+#: **OFF by default** (start == end disables it), so mail sends whenever it is
+#: queued. It defaulted to 09:00-19:00, which surprised people: a send pressed
+#: at 20:00 went HELD rather than out, and "the button did nothing" is a worse
+#: first impression than a mail arriving at an odd hour to a list you control.
+#:
+#: The machinery is intact, not deleted -- turn it back on by setting both, e.g.
+#: SCHEDULE_WINDOW_START=9 and SCHEDULE_WINDOW_END=19. Worth doing before the
+#: first large campaign to real prospects, when 3am delivery starts to cost
+#: something. Restraint on cold outreach is a real concern; it just should not
+#: be the thing standing between you and a test send.
+SCHEDULE_WINDOW_START = env.int("SCHEDULE_WINDOW_START", default=0)
+SCHEDULE_WINDOW_END = env.int("SCHEDULE_WINDOW_END", default=0)
 
 #: Weekdays mail may go out. Monday is 0, matching datetime.weekday().
 #: Default is all seven; set e.g. 0,1,2,3,4 for weekdays only.

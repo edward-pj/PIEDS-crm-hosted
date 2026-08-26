@@ -338,7 +338,7 @@ Settings reference:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SCHEDULE_WINDOW_START` / `_END` | `9` / `19` | Delivery window, in `TIME_ZONE`. Equal values disable it. |
+| `SCHEDULE_WINDOW_START` / `_END` | `0` / `0` | Delivery window, in `TIME_ZONE`. **Equal values disable it, and that is the shipped default** — mail sends whenever it is queued. Set `9` / `19` to restore a 09:00–19:00 window. |
 | `SCHEDULE_WINDOW_DAYS` | `0,1,2,3,4,5,6` | Weekdays mail may go out; Monday is 0. |
 | `SCHEDULE_GRACE_HOURS` | `6` | How late a job may still send before it is `missed`. |
 | `GMAIL_SEND_DELAY_SECONDS` | `0.0` | Pause between messages inside one batch. |

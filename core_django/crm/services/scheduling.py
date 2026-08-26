@@ -127,9 +127,10 @@ def create(*, campaign_id, member, contact_ids, scheduled_at, cc="", bcc="",
 # ------------------------------------------------------------------- timing
 
 def _window():
+    # Fallbacks match settings.py: 0 == 0 means no window, send whenever.
     return (
-        int(getattr(settings, "SCHEDULE_WINDOW_START", 9)),
-        int(getattr(settings, "SCHEDULE_WINDOW_END", 19)),
+        int(getattr(settings, "SCHEDULE_WINDOW_START", 0)),
+        int(getattr(settings, "SCHEDULE_WINDOW_END", 0)),
         set(getattr(settings, "SCHEDULE_WINDOW_DAYS", range(7))),
     )
 
