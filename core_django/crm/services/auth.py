@@ -33,6 +33,20 @@ SESSION_KEY = "member_id"
 #: Where Google is redirected back to, and where we stash the CSRF state.
 STATE_SESSION_KEY = "google_oauth_state"
 
+#: The PKCE code verifier for the in-flight sign-in.
+#:
+#: `Flow.authorization_url()` generates one and sends only its SHA-256 challenge
+#: to Google; the token exchange must then present the original. It lives on
+#: that Flow instance, and the callback necessarily builds a NEW Flow -- a
+#: different request, in a different process on a multi-worker deploy -- so
+#: without carrying it through the session it is simply gone, and Google refuses
+#: the exchange with "Missing code verifier".
+#:
+#: Kept rather than disabled with `autogenerate_code_verifier=False`. PKCE binds
+#: the authorization code to this specific flow, so a code intercepted from the
+#: callback URL is useless to anyone who does not also hold this session.
+VERIFIER_SESSION_KEY = "google_oauth_verifier"
+
 SCOPES = [
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
@@ -146,6 +160,7 @@ def google_authorization_url(request) -> str:
         hd=settings.GOOGLE_OAUTH_HOSTED_DOMAIN or None,
     )
     request.session[STATE_SESSION_KEY] = state
+    request.session[VERIFIER_SESSION_KEY] = flow.code_verifier
     return url
 
 
@@ -163,6 +178,7 @@ def member_from_google_callback(request) -> TeamMember:
     from google.oauth2 import id_token as google_id_token
 
     expected_state = request.session.pop(STATE_SESSION_KEY, None)
+    code_verifier = request.session.pop(VERIFIER_SESSION_KEY, None)
     if not expected_state or request.GET.get("state") != expected_state:
         raise GoogleAuthError("Sign-in state did not match. Please try again.")
 
@@ -170,6 +186,9 @@ def member_from_google_callback(request) -> TeamMember:
         raise GoogleAuthError("Google sign-in was cancelled.")
 
     flow = _flow(request)
+    # Restore the verifier this flow started with. Assigned before fetch_token
+    # rather than passed to it, because that is where the Flow reads it from.
+    flow.code_verifier = code_verifier
     try:
         flow.fetch_token(code=request.GET.get("code"))
     except Exception as exc:                                   # noqa: BLE001

@@ -1106,7 +1106,7 @@ ignite: tests pinned to localhost:5432/ignite_crm (never the hosted database)
 ```
 
 Verified by running the suite with `DATABASE_URL` pointed at a fake Supabase
-host: all 304 tests still pass against localhost.
+host: all 310 tests still pass against localhost.
 
 ---
 
@@ -1277,7 +1277,7 @@ designed but not deployed; see `docs/MAIL_SCHEDULING.md`. The ping interval is a
 .venv/bin/python -m pytest          # needs docker compose up
 ```
 
-**304 tests**, all passing:
+**310 tests**, all passing:
 
 | File | Count | Covers |
 |---|---|---|
@@ -1294,6 +1294,7 @@ designed but not deployed; see `docs/MAIL_SCHEDULING.md`. The ping interval is a
 | `test_login.py` | 11 | the one door, and that the deleted one stays deleted (§4.1) |
 | `test_send_recovery.py` | 9 | the 19 Aug incident: chunking, retry, no double-send |
 | `test_bootstrap.py` | 14 | `bootstrap_team` — the first team, and every re-run of it |
+| `test_oauth_pkce.py` | 6 | the PKCE verifier surviving between two requests |
 
 `test_mailing.py` used to be `test_mailing_api.py`, driven through the token API
 the laptop agent spoke. Only the tests genuinely *about* the API — bearer-token
@@ -1486,7 +1487,7 @@ ignite_crm/
 │       │                          seed_dev.py, stranded_drafts.py
 │       ├── migrations/            0001 … 0015_revoke_api_tokens
 │       ├── templates/crm/         22 templates
-│       └── tests/                 304 tests, incl. conftest.py
+│       └── tests/                 310 tests, incl. conftest.py
 │
 └── render.yaml                    the hosting blueprint
 ```

@@ -37,6 +37,12 @@ from .gmail import SCOPES
 #: other and both fail with "state did not match".
 STATE_SESSION_KEY = "gmail_oauth_state"
 
+#: The PKCE code verifier for the in-flight grant. Separate key from auth.py's
+#: for the same reason the state key is separate: a member connecting Gmail
+#: while a sign-in is half-finished must not clobber one flow with the other.
+#: See auth.py for why this has to survive in the session at all.
+VERIFIER_SESSION_KEY = "gmail_oauth_verifier"
+
 
 class GmailConsentError(RuntimeError):
     """Raised with a message that is safe to show the member."""
@@ -79,6 +85,7 @@ def authorization_url(request, member) -> str:
         hd=settings.GOOGLE_OAUTH_HOSTED_DOMAIN or None,
     )
     request.session[STATE_SESSION_KEY] = state
+    request.session[VERIFIER_SESSION_KEY] = flow.code_verifier
     return url
 
 
@@ -99,6 +106,7 @@ def _granted_email(credentials) -> str:
 def complete(request, member) -> GmailCredential:
     """Exchange the code and store the grant. Raises rather than half-storing."""
     expected_state = request.session.pop(STATE_SESSION_KEY, None)
+    code_verifier = request.session.pop(VERIFIER_SESSION_KEY, None)
     if not expected_state or request.GET.get("state") != expected_state:
         raise GmailConsentError("Gmail authorisation state did not match. Try again.")
 
@@ -109,6 +117,7 @@ def complete(request, member) -> GmailCredential:
         )
 
     flow = _flow(request)
+    flow.code_verifier = code_verifier
     try:
         flow.fetch_token(code=request.GET.get("code"))
     except Exception as exc:                                    # noqa: BLE001
