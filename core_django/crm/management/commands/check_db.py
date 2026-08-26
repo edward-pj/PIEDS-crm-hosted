@@ -39,7 +39,8 @@ REQUIRED_INVARIANTS = [
     (
         "campaign_mailings.root_campaign_id is NOT NULL",
         """SELECT 1 FROM information_schema.columns
-           WHERE table_name = 'campaign_mailings'
+           WHERE table_schema = current_schema()
+             AND table_name = 'campaign_mailings'
              AND column_name = 'root_campaign_id'
              AND is_nullable = 'YES'""",
         "Postgres unique indexes treat NULLs as DISTINCT, so a nullable root "
@@ -88,9 +89,33 @@ class Command(BaseCommand):
             cur.execute("SELECT version()")
             self.stdout.write(f"server   : {cur.fetchone()[0].split(',')[0]}")
 
+            # Printed because every check below is scoped to it. On a database
+            # shared with another project the app runs under its own schema,
+            # and "which schema did it just verify" stops being obvious.
+            cur.execute("SELECT current_schema()")
+            schema = cur.fetchone()[0]
+            self.stdout.write(f"schema   : {schema}")
+            if schema is None:
+                failures.append(
+                    "search_path resolves to no existing schema. Django will "
+                    "fail to find its own tables. Create the schema first: "
+                    "CREATE SCHEMA <name>;"
+                )
+
             for table, index, why in REQUIRED_INDEXES:
+                # `schemaname = current_schema()` is load-bearing, not tidy.
+                # Without it this matches an identically-named index in ANY
+                # schema -- and these names are generic enough that a shared
+                # database very plausibly has another `campaign_mailings`. The
+                # failure is the worst kind: check_db reports ok and exits 0
+                # while the schema the app actually writes to has no constraint
+                # at all, so the boot gate waves through a CRM that can
+                # double-mail. `current_schema()` is the first existing schema
+                # on the search_path, which is exactly where Django puts tables.
                 cur.execute(
-                    "SELECT 1 FROM pg_indexes WHERE tablename = %s AND indexname = %s",
+                    """SELECT 1 FROM pg_indexes
+                       WHERE schemaname = current_schema()
+                         AND tablename = %s AND indexname = %s""",
                     [table, index],
                 )
                 if cur.fetchone():
