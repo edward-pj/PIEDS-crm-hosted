@@ -1001,31 +1001,41 @@ a 200-mail batch inside one HTTP response makes "the tab was closed" a data
 question. Queueing makes it a non-event and reuses the lease, drip and recovery
 machinery that scheduled sends already had.
 
-Something must then drain the queue. Two doors, one code path
+Something must then drain the queue. Three doors, one code path
 (`services/runner.py::tick()`):
 
 | | |
 |---|---|
-| **Send queued mail now** on `/schedules/` | **any member**, POST — what the team actually uses |
+| `GET /internal/tick` | **the normal path.** An external pinger, every minute during its window. Authenticated by `TICK_SECRET` in an `X-Tick-Secret` header |
+| **Send queued mail now** on `/schedules/` | **any member**, POST — the manual override, for sending outside the window or proving the queue works without waiting |
 | `manage.py run_tick` | the same function from a shell, for local runs |
 
-A tick is bounded — `TICK_MAX_MAILS` (40) and `TICK_MAX_SECONDS` (45) — so it
-fits inside a request. Press it again for more. It is safe to press twice at
-once: `claim_due` uses `SELECT … FOR UPDATE SKIP LOCKED`, and
-`uniq_root_campaign_contact` is the real guarantee underneath regardless.
+Setup for the first one is `docs/PINGER_SETUP.md`: Supabase `pg_cron` drives it,
+cron-job.org watches it. **Without `TICK_SECRET` set, that route answers 503 and
+nothing sends on a timer** — `check_db` warns about this at boot.
 
-> **This is the one thing that is not hands-off yet.** The automatic scheduler —
-> an authenticated `/internal/tick` endpoint, a `pg_try_advisory_lock`, and an
-> external pinger — is designed in `docs/MAIL_SCHEDULING.md` and deliberately
-> **deferred**. Nothing about it changes the queue, the lease protocol or
-> `tick()` itself; it adds a door and a lock in front of an executor that
-> already exists and is already tested. Until it lands, mail leaves the building
-> when *somebody* presses the button — any member, not just a lead. That widening
-> is not a convenience: while the scheduler is deferred this button **is** the
-> send path, and gating it on a role meant a member pressed Send, watched their
-> mail sit in `queued`, and had no way to move it. It grants no new power —
-> `tick()` sends each job with its own owner's Gmail credential — and leads keep
-> the brake (cancel a job, pause the root). See [§23](#23-known-gaps).
+A tick is bounded — `TICK_MAX_MAILS` (40) and `TICK_MAX_SECONDS` (25), both
+env-configurable — so it fits inside a request and inside the watchdog's
+30-second cut-off. Whichever binds first, the run stops cleanly and the next
+continues from the cursor; the response reports `elapsed_seconds` and
+`stopped_early` so which one it was is measurable rather than guessed.
+
+**The ping interval is the throughput setting, not the tick size.** At 40 mails
+a minute the team ceiling is ~2,400/hour, and a 10:00–17:00 window is ~16,800
+mails a day — comfortably more than 20 members at 800 each.
+
+All three doors take a session-level advisory lock, so two pingers and a member
+all pressing at once is normal rather than a double-send: the losers get
+`{"locked": true}` and a 200. Underneath that, `claim_due` uses `SELECT … FOR
+UPDATE SKIP LOCKED` and `uniq_root_campaign_contact` remains the real guarantee
+regardless of any of it.
+
+> **The button is open to every member, not just leads.** That is deliberate.
+> Before the pinger existed the button *was* the send path, and gating it on a
+> role meant a member pressed Send, watched their mail sit in `queued`, and had
+> no way to move it. It grants no new power — `tick()` sends each job with its
+> own owner's Gmail credential — and leads keep the brake (cancel a job, pause
+> the root).
 
 ---
 
@@ -1120,7 +1130,7 @@ ignite: tests pinned to localhost:5432/ignite_crm (never the hosted database)
 ```
 
 Verified by running the suite with `DATABASE_URL` pointed at a fake Supabase
-host: all 317 tests still pass against localhost.
+host: all 357 tests still pass against localhost.
 
 ---
 
@@ -1277,8 +1287,11 @@ The entrypoint is the release step: it waits for Postgres, migrates, and runs
 
 ### Not yet automatic
 
-**Queued mail does not send on its own.** Somebody presses **Send queued mail
-now** on `/schedules/` — any member may, and it is safe to press twice. The automatic scheduler — an authenticated tick endpoint, a
+**Queued mail sends on a timer, once the pinger is set up.** That is
+`docs/PINGER_SETUP.md`, and it is a one-time manual step outside the repo:
+Render's free plan has no cron. Until it is done, mail waits for somebody to
+press **Send queued mail now** on `/schedules/` — any member may, and it is safe
+to press twice. The automatic scheduler — an authenticated tick endpoint, a
 session-level advisory lock, and an external pinger every 1–2 minutes — is
 designed but not deployed; see `docs/MAIL_SCHEDULING.md`. The ping interval is a
 *throughput* setting, not just a keep-alive one, so read that before choosing it.
@@ -1291,7 +1304,7 @@ designed but not deployed; see `docs/MAIL_SCHEDULING.md`. The ping interval is a
 .venv/bin/python -m pytest          # needs docker compose up
 ```
 
-**317 tests**, all passing:
+**357 tests**, all passing:
 
 | File | Count | Covers |
 |---|---|---|
@@ -1310,6 +1323,10 @@ designed but not deployed; see `docs/MAIL_SCHEDULING.md`. The ping interval is a
 | `test_bootstrap.py` | 14 | `bootstrap_team` — the first team, and every re-run of it |
 | `test_oauth_pkce.py` | 6 | the PKCE verifier surviving between two requests |
 | `test_run_queue_permission.py` | 6 | that draining the queue stays open to every member |
+| `test_tick_endpoint.py` | 14 | the tick secret, and the advisory lock that makes two pingers safe |
+| `test_daily_cap.py` | 10 | that a cap-blocked contact keeps its place in the queue |
+| `test_send_all.py` | 10 | one button for a whole queue, and what it may not resolve |
+| `test_tick_fairness.py` | 6 | one tick's budget shared across the team |
 
 `test_mailing.py` used to be `test_mailing_api.py`, driven through the token API
 the laptop agent spoke. Only the tests genuinely *about* the API — bearer-token
@@ -1502,7 +1519,7 @@ ignite_crm/
 │       │                          seed_dev.py, stranded_drafts.py
 │       ├── migrations/            0001 … 0015_revoke_api_tokens
 │       ├── templates/crm/         22 templates
-│       └── tests/                 317 tests, incl. conftest.py
+│       └── tests/                 357 tests, incl. conftest.py
 │
 └── render.yaml                    the hosting blueprint
 ```
@@ -1674,27 +1691,34 @@ display name or substitutes the account's own "Send mail as" name, and how
 CC/BCC behave in a real batch. **Test any change to the send path with a batch
 of one to your own address before pointing it at real prospects.**
 
-**Nothing drains the send queue automatically.** This is the largest gap and
-the one to read first. Pressing Send commits a `ScheduledSend` due now; a
-scheduled send and a follow-up do the same. All of them then wait until someone
-runs `tick()` — the **Send queued mail now** button or `manage.py run_tick`
-(§13.3). Queued mail is not lost and not sent twice; it simply does not move on
-its own, and a job whose grace window closes first is marked `missed`.
+**The queue drains itself only after a one-time manual setup.** The code side
+is done — `GET /internal/tick`, the advisory lock, the sweeps — but Render's free
+plan has no cron, so the thing that *calls* it lives outside this repo and
+outside this machine. Until somebody follows `docs/PINGER_SETUP.md`, queued mail
+waits for **Send queued mail now**. `check_db` warns at boot when `TICK_SECRET`
+is unset, which is the tell.
 
-What is missing is small and deliberately scoped: a `GET /internal/tick`
-authenticated with `secrets.compare_digest` against `TICK_SECRET`, a
-session-level `pg_try_advisory_lock` around the call, and an external pinger
-(Render's free plan has no cron). The executor it would sit in front of already
-exists and is already tested. `docs/MAIL_SCHEDULING.md` has the full design,
-including why an in-process thread from `AppConfig.ready()` was rejected.
+**The ping interval is the throughput setting, not the tick size.** A tick is
+capped at `TICK_MAX_MAILS` (40), so a 1-minute ping is ~2,400 mails/hour
+team-wide and a 10-minute ping is ~240. Ten minutes is the interval you would
+pick if you were only thinking about keeping the instance awake, and it would
+quietly turn a launch blast into most of a day.
 
-**The ping interval will be a throughput setting, not just a keep-alive one.**
-When that lands: a tick is capped at `TICK_MAX_MAILS` (40), so a 1-minute ping
-is ~2,000 mails/hour team-wide and a 10-minute ping is ~240. Ten minutes is the
-interval you would pick if you were only thinking about keeping the instance
-awake, and it would quietly turn a launch blast into most of a day. Say the new
-shape out loud before the first big campaign rather than letting the team
-discover it.
+**Outside the pinger's window nothing sends by itself.** With a 10:00–17:00
+window a send queued at 18:00 sits `PENDING` until morning. `SCHEDULE_GRACE_HOURS`
+is 20 so the missed-sweep does not kill it overnight — at the old 6 it marked
+every evening's queue `missed` before dawn. Anyone can still force it with the
+button at any hour.
+
+**Reply detection and follow-up rules still do not run on a timer.** `tick()`
+runs the lease and missed sweeps but not `followups.run_all_rules`. A follow-up
+is queued correctly and then waits like any other job.
+
+**Nothing here addresses deliverability.** No `List-Unsubscribe` header, no
+send-rate ramp, no domain authentication. At five or more members sending 800 a
+day the domain crosses Google's 5,000/day bulk-sender threshold, which brings its
+own requirements. That was an explicit decision (28 Aug 2026), recorded here so
+it stays visible rather than being rediscovered as a deliverability mystery.
 
 **Reply detection reads the thread, not the meaning.** A follow-up is cancelled
 by any message from the prospect's address in the thread, including "wrong

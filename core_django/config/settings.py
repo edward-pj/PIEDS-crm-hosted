@@ -240,6 +240,17 @@ DAILY_SEND_CAP = env.int("DAILY_SEND_CAP", default=800)
 #:   python -c 'import secrets; print(secrets.token_urlsafe(32))'
 TICK_SECRET = env("TICK_SECRET", default="")
 
+#: Ceilings on one tick. Whichever binds first stops the run cleanly and the
+#: next tick continues from the cursor, so these are safety limits rather than
+#: throughput settings -- the PING INTERVAL is the throughput setting.
+#:
+#: Seconds must stay under two things: gunicorn's --timeout (120, see Dockerfile)
+#: and the alerting pinger's own cut-off (30 on cron-job.org's free tier).
+#: Mails is a ceiling on top of that. Raise them from measurement, not hope:
+#: /internal/tick reports elapsed_seconds and stopped_early on every call.
+TICK_MAX_MAILS = env.int("TICK_MAX_MAILS", default=40)
+TICK_MAX_SECONDS = env.int("TICK_MAX_SECONDS", default=25)
+
 
 # --- who may sign in ------------------------------------------------------
 # Batch 2024 picks a name; batch 2025 signs in with Google. The reasoning is in

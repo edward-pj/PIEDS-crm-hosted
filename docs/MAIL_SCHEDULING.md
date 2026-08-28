@@ -110,22 +110,27 @@ holds every credential and could widen the query. The `member` filter is what
 guarantees a job sends from the mailbox it was queued against; `sent_by` stops
 meaning anything without it. The tick loops over members instead.
 
-### What is not built yet
+### How it is driven
 
-`tick()` has two doors today — the **Send queued mail now** button on
-`/schedules/`, which any member may press, and `manage.py run_tick`. Both are
-manual. **Nothing runs it on a
-timer**, so a due job waits until a human presses something.
-
-Closing that is a deliberately small, deliberately deferred piece of work:
+`tick()` has three doors and one code path:
 
 | Piece | Why |
 |---|---|
-| `GET /internal/tick`, authenticated with `secrets.compare_digest` against `TICK_SECRET` | the pinger is not a team member, so a shared secret rather than a session or a token row |
+| `GET /internal/tick`, authenticated with `secrets.compare_digest` against `TICK_SECRET` | the pinger is not a team member, so a shared secret rather than a session or a token row. A header, never a query string: Render logs full request lines |
 | session-level `pg_try_advisory_lock` around the call, released in a `finally` | two pings landing on two gunicorn workers means two ticks, and workers share no memory |
-| an external pinger every 1–2 minutes | Render's free plan has **no cron**, and a self-ping cannot wake an instance that is already asleep |
+| an external pinger every minute | Render's free plan has **no cron**, and a self-ping cannot wake an instance that is already asleep |
 
-Three things to know before building it:
+Supabase `pg_cron` + `pg_net` is the driver, cron-job.org the failure alarm.
+`docs/PINGER_SETUP.md` has the exact SQL and settings. An unset `TICK_SECRET`
+disables the route (503) rather than defaulting it open — a blank
+`compare_digest` against a blank header would authenticate anybody sending
+nothing at all.
+
+**Still not run on a timer:** reply detection and `followups.run_all_rules`.
+Left out deliberately rather than forgotten; adding them changes nothing about
+the queue, the lock or the lease protocol.
+
+Three things worth knowing:
 
 - **Session-level, not `pg_try_advisory_xact_lock`.** The transactional variant
   needs the whole tick inside one transaction, which is impossible: `claim_batch`
@@ -135,10 +140,14 @@ Three things to know before building it:
   session lock taken on one pooled backend is invisible to the next statement,
   with no error, so two ticks simply run at once. `check_db` already refuses port
   6543 for `SELECT … FOR UPDATE`; that check protects the scheduler too.
-- **The ping interval is a throughput setting.** A tick is capped at
-  `TICK_MAX_MAILS` (40), so 1 minute is ~2,000 mails/hour team-wide and 10
-  minutes is ~240. Ten minutes is what you would pick thinking only about
+- **The ping interval is the throughput setting, not the tick size.** A tick is
+  capped at `TICK_MAX_MAILS` (40), so 1 minute is ~2,400 mails/hour team-wide
+  and 10 minutes is ~240. Ten minutes is what you would pick thinking only about
   keep-alive, and it would quietly turn a launch blast into most of a day.
+- **One tick's budget is shared.** `PER_MEMBER_TICK_MAILS` (10) caps any one
+  member's share, and `sendable_members()` rotates by wall-clock minute, because
+  `TeamMember.Meta.ordering` is `["name"]` and a hard budget otherwise means the
+  alphabetically first member drains completely before anyone else is touched.
 
 An in-process thread from `AppConfig.ready()` was considered and **rejected**:
 `ready()` runs in every gunicorn worker (so, several schedulers racing), and also
@@ -298,7 +307,7 @@ before the *next* contact; mail already sent stays sent and its rows stand.
 ## ✅ Phase 3 — quiet hours and the grace window
 
 Implements §5. Settings: `SCHEDULE_QUIET_START` / `SCHEDULE_QUIET_END` (default 09:00–19:00 IST),
-`SCHEDULE_QUIET_DAYS`, `SCHEDULE_GRACE_HOURS` (default 6). A campaign paused between scheduling and
+`SCHEDULE_QUIET_DAYS`, `SCHEDULE_GRACE_HOURS` (default 20). A campaign paused between scheduling and
 execution becomes `HELD`, then `MISSED` at the deadline: pausing is the documented emergency brake
 (README §5) and must stop a scheduled send visibly, not by silent deletion.
 
@@ -307,7 +316,7 @@ execution becomes `HELD`, then `MISSED` at the deadline: pausing is the document
 Per job: `batch_size`, `interval_minutes`, optional `per_day`, optional jitter so gaps are not
 machine-regular. Each tick takes `contact_ids[cursor : cursor + batch_size]` and advances.
 
-Two existing limits stay authoritative and are never overridden: `DAILY_SEND_CAP = 400`, enforced
+Two existing limits stay authoritative and are never overridden: `DAILY_SEND_CAP` (800, from settings), enforced
 server-side and counted across everything a member sends, and `GMAIL_SEND_DELAY_SECONDS` for
 intra-batch pacing (now `0.0` by default — the old 2-second pause existed for a laptop sitting in a
 loop, and inside a bounded tick it only burns budget). A drip that hits the cap parks until the 24-hour window rolls, exactly as `claim_batch`
@@ -341,7 +350,7 @@ Settings reference:
 |---|---|---|
 | `SCHEDULE_WINDOW_START` / `_END` | `0` / `0` | Delivery window, in `TIME_ZONE`. **Equal values disable it, and that is the shipped default** — mail sends whenever it is queued. Set `9` / `19` to restore a 09:00–19:00 window. |
 | `SCHEDULE_WINDOW_DAYS` | `0,1,2,3,4,5,6` | Weekdays mail may go out; Monday is 0. |
-| `SCHEDULE_GRACE_HOURS` | `6` | How late a job may still send before it is `missed`. |
+| `SCHEDULE_GRACE_HOURS` | `20` | How late a job may still send before it is `missed`. Must exceed the longest gap the pinger's window creates — 17 h for a 10:00–17:00 window. |
 | `GMAIL_SEND_DELAY_SECONDS` | `0.0` | Pause between messages inside one batch. |
 
 And, as module constants rather than env vars, because changing them is a decision and not a knob:
@@ -349,8 +358,10 @@ And, as module constants rather than env vars, because changing them is a decisi
 | Constant | Value | Meaning |
 |---|---|---|
 | `runner.CLAIM_LIMIT` | `5` | Jobs leased per member per tick. |
-| `runner.TICK_MAX_MAILS` | `40` | Hard cap on one tick, so it fits inside a request. |
-| `runner.TICK_MAX_SECONDS` | `45` | Wall-clock cap on one tick, same reason. |
+| `runner.TICK_MAX_MAILS` | `40` | Hard cap on one tick, so it fits inside a request. Env-configurable. |
+| `runner.TICK_MAX_SECONDS` | `25` | Wall-clock cap on one tick — and under cron-job.org's 30 s cut-off, so the alarm reports truth. Env-configurable. |
+| `runner.PER_MEMBER_TICK_MAILS` | `10` | One member's share of a tick, so nobody drains the whole budget. |
+| `settings.TICK_SECRET` | — | Shared secret for `/internal/tick`. Blank disables the route. |
 | `scheduling.LEASE_MINUTES` | `5` | How long a lease survives before a sweep reclaims it. |
 | `sending.CLAIM_CHUNK` | `10` | Contacts claimed at once — see the 19 Aug incident, README §7. |
 
@@ -360,11 +371,13 @@ And, as module constants rather than env vars, because changing them is a decisi
 
 ### Making queued mail go out
 
-Nothing is on a timer (§2). Two doors, one code path:
+Normally the pinger does it (§2, and `docs/PINGER_SETUP.md`). The other two doors
+are for when you do not want to wait a minute, or are not deployed:
 
 | | |
 |---|---|
-| **Send queued mail now** on `/schedules/` | any member, POST — what the team uses |
+| `GET /internal/tick` | the pinger's door, every minute during its window |
+| **Send queued mail now** on `/schedules/` | any member, POST — the manual override |
 | `manage.py run_tick` | the same function from a shell, for local work |
 
 ```bash
@@ -372,16 +385,20 @@ cd core_django && ../.venv/bin/python manage.py run_tick
 ```
 
 It prints what it did: leases taken, mails sent, jobs finished, jobs held. A
-tick is bounded by `TICK_MAX_MAILS` (40) and `TICK_MAX_SECONDS` (45) so it fits
-inside a request — press it again for more.
+tick is bounded by `TICK_MAX_MAILS` (40) and `TICK_MAX_SECONDS` (25) so it fits
+inside a request — and inside cron-job.org's 30-second cut-off, so the alarm
+reports truth. Both are env-configurable; `elapsed_seconds` in the tick's JSON
+tells you which one is actually binding.
 
-**Render's free tier has no shell.** On the deployed instance the button is the
-only way, which is why it exists at all rather than waiting for the scheduler.
+**Render's free tier has no shell.** On the deployed instance the button and the
+endpoint are the only ways in — `manage.py run_tick` cannot be run there at all.
 
-It is safe to run two at once: `claim_due` uses `SELECT … FOR UPDATE SKIP
-LOCKED`, so the second tick takes different jobs, and `uniq_root_campaign_contact`
-is the real guarantee underneath regardless. The advisory lock in §2 is about
-not wasting work, not about correctness of the mail itself.
+It is safe to run two at once, at three independent levels: the advisory lock
+means the second one returns `{"locked": true}` without starting; if it somehow
+did start, `claim_due` uses `SELECT … FOR UPDATE SKIP LOCKED` so it would take
+different jobs; and underneath both, `uniq_root_campaign_contact` is the real
+guarantee that no prospect is mailed twice. The lock is about not wasting work,
+never about correctness of the mail itself.
 
 ### Everyone connects their own Gmail
 

@@ -34,9 +34,11 @@ the thread only runs when something is already keeping the service awake.
 
 import logging
 import socket
+import time
 from dataclasses import dataclass, field
 from datetime import timedelta
 
+from django.conf import settings
 from django.db import connection
 from django.utils import timezone
 
@@ -55,8 +57,18 @@ CLAIM_LIMIT = 5
 #: proxy timeout and must not monopolise a worker. Both are ceilings, not
 #: targets: a tick that runs out of budget simply stops, and the next one
 #: continues from the cursor.
-TICK_MAX_MAILS = 40
-TICK_MAX_SECONDS = 45
+#:
+#: 25 seconds, down from 45, so a tick fits inside cron-job.org's 30-second
+#: free-tier cut-off. That matters even though pg_net is the real driver and is
+#: asynchronous: cron-job.org's whole job is to email somebody when the endpoint
+#: stops answering, and an alerting channel that reports failure on every
+#: healthy tick is worse than none.
+#:
+#: Both are env-configurable because the right value depends on Gmail's latency
+#: from wherever this is deployed, which is measured rather than guessed -- see
+#: TickReport.elapsed_seconds. Whichever binds first, `stopped_early` says so.
+TICK_MAX_MAILS = int(getattr(settings, "TICK_MAX_MAILS", 40))
+TICK_MAX_SECONDS = int(getattr(settings, "TICK_MAX_SECONDS", 25))
 
 #: The most one member may take out of a single tick's budget.
 #:
@@ -89,6 +101,10 @@ class TickReport:
     locked: bool = False
     leases_recovered: int = 0
     marked_missed: int = 0
+    #: Wall-clock time the tick took. The only way to know whether
+    #: TICK_MAX_MAILS or TICK_MAX_SECONDS is the binding constraint, and
+    #: therefore the only honest basis for changing either.
+    elapsed_seconds: float = 0.0
 
     def dict(self):
         return {
@@ -102,6 +118,7 @@ class TickReport:
             "locked": self.locked,
             "leases_recovered": self.leases_recovered,
             "marked_missed": self.marked_missed,
+            "elapsed_seconds": round(self.elapsed_seconds, 2),
         }
 
 
@@ -318,9 +335,12 @@ def tick(*, now=None, max_seconds=TICK_MAX_SECONDS, gmail_for=None,
     if lock and not _try_lock():
         report.locked = True
         return report
+
+    started = time.monotonic()
     try:
         _run(report, now=now, max_seconds=max_seconds, gmail_for=gmail_for)
     finally:
+        report.elapsed_seconds = time.monotonic() - started
         if lock:
             _unlock()
     return report
