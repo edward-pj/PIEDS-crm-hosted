@@ -39,6 +39,7 @@ log = logging.getLogger(__name__)
 SENT = mailing.SENT
 FAILED = mailing.FAILED
 ALREADY_MAILED = mailing.ALREADY_MAILED
+CAP_REACHED = mailing.CAP_REACHED
 
 #: Contacts reserved per round trip.
 #:
@@ -127,6 +128,13 @@ def send_batch(
                 yield Outcome(str(cid), "", "", FAILED, f"could not reserve: {exc}")
             return
 
+        # A cap-blocked contact is the one refusal that is TEMPORARY: the
+        # rolling 24-hour window frees it again, and they are still owed a mail.
+        # Note it, but do not act on it until this chunk's claimed contacts have
+        # been settled -- they hold DRAFT rows, and returning early would strand
+        # every one of them for a quota that has nothing to do with them.
+        cap_reached = any(skip.code == CAP_REACHED for skip in skipped)
+
         # Report everything the server refused before touching Gmail.
         for skip in skipped:
             yield Outcome(
@@ -208,6 +216,13 @@ def send_batch(
             remaining -= 1
             if delay and remaining > 0:
                 time.sleep(delay)
+
+        if cap_reached:
+            # The budget cannot recover inside one run, so every later chunk
+            # would come back refused identically. Stopping here is not just an
+            # optimisation: without it the loop rips through the whole remainder
+            # in seconds, and the caller counts each refusal as an attempt.
+            return
 
 
 def reconcile(member, *, gmail=None, max_rounds: int = 20) -> list[Outcome]:

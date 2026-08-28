@@ -74,6 +74,19 @@ services:
       - key: SEED_DEV
         value: "false"
 
+      # Mails per member per ROLLING 24 hours. Here rather than in code because
+      # it is the number most likely to need changing at short notice -- ramping
+      # a new team up, or backing off when Gmail starts throttling -- and a
+      # redeploy is the wrong unit of work for that.
+      - key: DAILY_SEND_CAP
+        value: "800"
+
+      # Must exceed the longest gap the pinger's window can create. With the
+      # pinger on 10:00-17:00 IST that gap is 17 hours (17:00 to 10:00), so a
+      # 6-hour grace marks every evening's queue MISSED before dawn.
+      - key: SCHEDULE_GRACE_HOURS
+        value: "20"
+
       # A pooler has a finite slot count; holding one open per worker per
       # request cycle exhausts it long before traffic does.
       - key: DB_CONN_MAX_AGE

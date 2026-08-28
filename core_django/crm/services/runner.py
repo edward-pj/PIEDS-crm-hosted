@@ -38,7 +38,7 @@ from crm.models import GmailCredential, TeamMember
 
 from . import scheduling as schedule_svc
 from .gmail import GmailAuthError, GmailClient
-from .sending import SENT, send_batch
+from .sending import CAP_REACHED, SENT, send_batch
 
 log = logging.getLogger(__name__)
 
@@ -104,12 +104,19 @@ def run_job(member, job, *, gmail, budget, deadline) -> dict:
     Counts `attempted`, not just sent: the cursor advances by that, and a
     contact permanently skipped (unassigned, archived, do_not_contact) must move
     it too, or the job never finishes.
+
+    `CAP_REACHED` is the exception, and getting it wrong lost mail. It is the
+    only refusal that is TEMPORARY -- the daily cap is a rate limit, and the
+    contact is still owed a mail once the rolling window frees. Counting it as
+    an attempt marched the cursor past everyone the quota had refused and
+    reported the job `done`, silently, with nothing sent to them ever. So it is
+    reported separately and deliberately kept out of `attempted`.
     """
     contact_ids = job.next_slice(job.batch_size or None)
     if not contact_ids:
-        return {"attempted": 0, "sent": 0, "skipped": 0, "error": ""}
+        return {"attempted": 0, "sent": 0, "skipped": 0, "cap_blocked": 0, "error": ""}
 
-    sent = skipped = 0
+    sent = skipped = cap_blocked = 0
     resolved = 0
     errors: list[str] = []
 
@@ -118,6 +125,9 @@ def run_job(member, job, *, gmail, budget, deadline) -> dict:
         cc=job.cc, bcc=job.bcc,
         gmail=gmail, max_mails=budget, deadline=deadline,
     ):
+        if outcome.status == CAP_REACHED:
+            cap_blocked += 1
+            continue
         resolved += 1
         if outcome.status == SENT:
             sent += 1
@@ -126,6 +136,14 @@ def run_job(member, job, *, gmail, budget, deadline) -> dict:
             if outcome.detail:
                 errors.append(f"{outcome.email}: {outcome.detail}")
 
+    if cap_blocked:
+        # First, not appended: it explains why the job stopped, which is what
+        # somebody reading the schedule page needs before any individual error.
+        errors.insert(0, (
+            f"paused on the daily send cap; {cap_blocked} contact(s) still "
+            f"queued and will go out once the 24-hour window frees"
+        ))
+
     return {
         # `resolved`, not `len(contact_ids)`: a bounded run may stop partway
         # through the slice, and advancing the cursor past contacts nobody
@@ -133,14 +151,22 @@ def run_job(member, job, *, gmail, budget, deadline) -> dict:
         "attempted": resolved,
         "sent": sent,
         "skipped": skipped,
+        "cap_blocked": cap_blocked,
         # Only a sample: a batch of 200 bad addresses should not post 200 lines
         # of prose into a text column someone has to read.
         "error": "; ".join(errors[:5])[:2000],
     }
 
 
-def run_for_member(member, report, *, deadline, gmail=None) -> None:
-    """Drain what this member has due, within the tick's budget."""
+def run_for_member(member, report, *, deadline, now=None, gmail=None) -> None:
+    """Drain what this member has due, within the tick's budget.
+
+    `now` is the tick's own moment, threaded through rather than re-read here.
+    One tick is one instant: claim_due's due-date and back-off arithmetic must
+    agree with the deadline this run is being held to, and with what the other
+    members in the same tick saw.
+    """
+    now = now or timezone.now()
     try:
         client = GmailClient(member) if gmail is None else gmail
         # Proves the token really belongs to this member before anything is
@@ -152,7 +178,9 @@ def run_for_member(member, report, *, deadline, gmail=None) -> None:
         log.info("skipping %s: %s", member.bits_email, exc)
         return
 
-    jobs = schedule_svc.claim_due(member, agent_id=executor_id(), limit=CLAIM_LIMIT)
+    jobs = schedule_svc.claim_due(
+        member, agent_id=executor_id(), limit=CLAIM_LIMIT, now=now
+    )
     for job in jobs:
         report.jobs += 1
         remaining = TICK_MAX_MAILS - report.sent
@@ -179,7 +207,8 @@ def run_for_member(member, report, *, deadline, gmail=None) -> None:
         schedule_svc.record_progress(
             job.id, member,
             attempted=result["attempted"], sent=result["sent"],
-            skipped=result["skipped"], error=result["error"],
+            skipped=result["skipped"], cap_blocked=result["cap_blocked"],
+            error=result["error"], now=now,
         )
 
         if timezone.now() >= deadline or report.sent >= TICK_MAX_MAILS:
@@ -208,7 +237,7 @@ def tick(*, now=None, max_seconds=TICK_MAX_SECONDS, gmail_for=None) -> TickRepor
         report.members += 1
         try:
             run_for_member(
-                member, report, deadline=deadline,
+                member, report, deadline=deadline, now=now,
                 gmail=gmail_for(member) if gmail_for else None,
             )
         except Exception as exc:                                # noqa: BLE001

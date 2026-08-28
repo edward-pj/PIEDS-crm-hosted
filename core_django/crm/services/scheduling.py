@@ -33,6 +33,11 @@ from .mailing import InvalidCopyAddresses, parse_copy_addresses
 #: does not strand a send until someone notices.
 LEASE_MINUTES = 5
 
+#: How long to wait before re-leasing a job that stopped on its owner's daily
+#: send cap. Long enough that the scheduler stops picking up a job it cannot
+#: advance; short enough that the queue resumes promptly once quota frees.
+CAP_RETRY_MINUTES = 30
+
 #: Refuse a schedule set for the past. A little slack absorbs clock skew between
 #: a laptop and the server without letting anyone schedule yesterday.
 PAST_TOLERANCE_SECONDS = 60
@@ -316,6 +321,14 @@ def claim_due(member, agent_id="", limit=5, now=None) -> list[ScheduledSend]:
     # ignores it would lease job after job only to have every mail refused, burn
     # the attempts counter, and look like a failure rather than a quota.
     if remaining_quota(member) <= 0:
+        # Push the due jobs out rather than merely walking away. deliver_after()
+        # reads next_run_at, so a job left untouched here keeps a deadline
+        # measured from a moment we ourselves refused to let it run -- and the
+        # missed-sweep declares a healthy queue MISSED for waiting on our own
+        # quota. Moving the clock is what makes "wait for the window" honest.
+        ScheduledSend.objects.filter(id__in=[job.id for job in candidates]).update(
+            next_run_at=now + timedelta(minutes=CAP_RETRY_MINUTES), updated_at=now
+        )
         return []
 
     claimed = []
@@ -381,12 +394,17 @@ def sweep_expired_leases(now=None) -> int:
 # ------------------------------------------------------------------ progress
 
 @transaction.atomic
-def record_progress(job_id, member, *, attempted, sent, skipped, error="", now=None) -> dict:
-    """Advance the cursor after an agent has sent a slice.
+def record_progress(job_id, member, *, attempted, sent, skipped, error="",
+                    cap_blocked=0, now=None) -> dict:
+    """Advance the cursor after an executor has sent a slice.
 
-    `attempted` is how many contacts the agent got through, sent or not. The
+    `attempted` is how many contacts the executor got through, sent or not. The
     cursor advances by that, NOT by `sent`: a contact who was skipped for good
     (unassigned, archived, do_not_contact) must not be retried forever.
+
+    `cap_blocked` is counted separately and is NOT part of `attempted`, because
+    the daily cap is a rate limit rather than a verdict -- see runner.run_job.
+    Those contacts keep their place in the queue.
     """
     now = now or timezone.now()
 
@@ -420,6 +438,15 @@ def record_progress(job_id, member, *, attempted, sent, skipped, error="", now=N
         job.leased_by = ""
         if job.interval_minutes:
             job.next_run_at = now + timedelta(minutes=job.interval_minutes)
+        elif cap_blocked:
+            # Back off, and reuse the drip's own field to do it. Two things fall
+            # out of that, and the second is the one that matters: claim_due
+            # stops leasing a job it cannot advance, AND deliver_after() reads
+            # next_run_at -- so the missed-sweep's clock moves with the job.
+            # Without this, a queue longer than one day's quota is declared
+            # MISSED for a lateness the cap made unavoidable, which is exactly
+            # the shape of the bug this whole change exists to fix.
+            job.next_run_at = now + timedelta(minutes=CAP_RETRY_MINUTES)
 
     job.save()
     return {"status": job.status, "cursor": job.cursor, "remaining": job.remaining}

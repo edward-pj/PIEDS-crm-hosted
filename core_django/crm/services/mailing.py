@@ -10,6 +10,7 @@ Read the ordering comments before changing anything.
 from dataclasses import dataclass
 from datetime import timedelta
 
+from django.conf import settings
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.validators import validate_email
 from django.db import IntegrityError, transaction
@@ -38,7 +39,11 @@ FAILED = "FAILED"
 
 #: Gmail's per-account quota is real; tripping it throttles the whole mailbox
 #: for hours. Enforced server-side so it counts across every device a member uses.
-DAILY_SEND_CAP = 400
+#:
+#: Read from settings so it can be changed without a deploy -- see
+#: config/settings.py::DAILY_SEND_CAP. Bound at import: a per-call lookup would
+#: let the limit shift between two chunks of the same run.
+DAILY_SEND_CAP = settings.DAILY_SEND_CAP
 
 #: CC/BCC apply to EVERY mail in a batch, so ten copied addresses on a 200-mail
 #: send is two thousand extra deliveries. Small enough to keep that a decision

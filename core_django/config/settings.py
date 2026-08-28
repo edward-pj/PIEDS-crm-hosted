@@ -211,7 +211,24 @@ SCHEDULE_WINDOW_DAYS = env.list(
 #: How late a job may still go out. Measured from the moment it was first
 #: ALLOWED to run, not from scheduled_at -- a job deferred overnight by the
 #: window must not be declared missed for a lateness it could not avoid.
-SCHEDULE_GRACE_HOURS = env.int("SCHEDULE_GRACE_HOURS", default=6)
+#:
+#: 20 hours, not 6, because the queue is now drained by an external pinger on a
+#: fixed daily window rather than by whoever happens to be looking at the CRM.
+#: With the pinger running 10:00-17:00 IST, a send queued at 18:00 has nothing
+#: to execute it until 10:00 the next morning -- a 16-hour wait that is correct
+#: behaviour. At 6 hours the sweep marked every one of those MISSED around
+#: midnight, and a member arrived to a queue of failures nobody had failed.
+SCHEDULE_GRACE_HOURS = env.int("SCHEDULE_GRACE_HOURS", default=20)
+
+#: Mails one member may send per rolling 24 hours. Enforced server-side by
+#: mailing.claim_batch, so it holds across every device and every campaign.
+#:
+#: An operational number, not a code constant: it is the thing most likely to
+#: need changing at short notice -- ramping a new team up, or backing off when
+#: Gmail starts throttling -- and a redeploy is the wrong unit of work for that.
+#: A cap-blocked contact keeps its place in the queue and goes out when the
+#: window frees; it is a rate limit, never a refusal.
+DAILY_SEND_CAP = env.int("DAILY_SEND_CAP", default=800)
 
 
 # --- who may sign in ------------------------------------------------------
