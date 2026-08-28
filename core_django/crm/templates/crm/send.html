@@ -81,7 +81,10 @@
         <p class="muted text-sm">
           {{ queue_total }} contact(s) assigned to you and not yet mailed for this
           campaign.
-          {% if queue_total > 500 %}Showing the first 500.{% endif %}
+          {% if queue_total > table_limit %}
+            The table below shows the first {{ table_limit }} — <em>Send all</em>
+            covers all {{ queue_total }}.
+          {% endif %}
         </p>
       </header>
 
@@ -113,15 +116,36 @@
             </section>
           </div>
 
+          {# The whole point of the screen. "Send all" posts one flag and lets
+             the server re-resolve the queue, so it works at any size and does
+             not care what the table below shows or how many boxes are ticked. #}
           <div class="row" style="gap:.5rem">
-            <button type="submit" name="action" value="preflight" class="btn btn-outline">
-              Dry run
+            <button type="submit" name="action" value="preflight_all"
+                    class="btn btn-outline">
+              Dry run all {{ queue_total }}
             </button>
-            <button type="submit" name="action" value="send" class="btn"
+            <button type="submit" name="action" value="send_all" class="btn"
                     {% if not gmail_connected %}disabled{% endif %}>
-              Send selected
+              Send all {{ queue_total }}
             </button>
           </div>
+
+          <details>
+            <summary class="text-sm muted">Send only some of them</summary>
+            <div class="row mt-1" style="gap:.5rem">
+              <button type="submit" name="action" value="preflight"
+                      class="btn-outline btn-sm">
+                Dry run selected
+              </button>
+              <button type="submit" name="action" value="send" class="btn-sm btn"
+                      {% if not gmail_connected %}disabled{% endif %}>
+                Send selected
+              </button>
+            </div>
+            <p class="text-sm muted mt-1">
+              Uses the tick boxes in the table below.
+            </p>
+          </details>
 
           {# Said here rather than discovered on the next screen. Send queues;
              the queue is drained by a button. Two steps is surprising, and a

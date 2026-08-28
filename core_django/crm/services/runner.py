@@ -52,6 +52,16 @@ CLAIM_LIMIT = 5
 TICK_MAX_MAILS = 40
 TICK_MAX_SECONDS = 45
 
+#: The most one member may take out of a single tick's budget.
+#:
+#: Without it the first member in the iteration order consumes the whole 40 and
+#: everybody else waits for a tick they can have to themselves. At 800 mails a
+#: head that is not a rounding error: it is the difference between the last
+#: member's first mail going out three hours after the first member's, and
+#: everyone progressing together. Four members per tick, and the rotation in
+#: sendable_members() decides which four.
+PER_MEMBER_TICK_MAILS = 10
+
 
 @dataclass
 class TickReport:
@@ -82,20 +92,36 @@ def executor_id() -> str:
     return f"server:{socket.gethostname()}"
 
 
-def sendable_members():
-    """Members the server can actually send as.
+def sendable_members(now=None):
+    """Members the server can actually send as, rotated so nobody is always last.
 
     Anyone without a live Gmail grant is skipped rather than leased and failed:
     leasing a job we cannot execute burns the attempts counter and fills
     `last_error` with the same sentence every tick, which buries the real
     failures under noise.
+
+    The rotation exists because `TeamMember.Meta.ordering` is `["name"]` and a
+    tick stops at `TICK_MAX_MAILS`. Alphabetical order plus a hard budget means
+    Aarav's queue drains completely before Kabir's is touched at all -- fine at
+    40 mails a day, and three hours of skew at 800.
+
+    Derived from wall-clock minutes rather than stored, so there is no column to
+    migrate and nothing to get out of step across two gunicorn workers. It is
+    NOT a strict round-robin: somebody connecting Gmail mid-day shifts every
+    offset by one. Over an hour the distribution is even, which is all this
+    needs to be.
     """
+    now = now or timezone.now()
     member_ids = (
         GmailCredential.objects
         .filter(revoked_at__isnull=True)
         .values_list("member_id", flat=True)
     )
-    return TeamMember.objects.filter(id__in=list(member_ids), is_active=True)
+    members = list(TeamMember.objects.filter(id__in=list(member_ids), is_active=True))
+    if not members:
+        return members
+    offset = int(now.timestamp() // 60) % len(members)
+    return members[offset:] + members[:offset]
 
 
 def run_job(member, job, *, gmail, budget, deadline) -> dict:
@@ -181,9 +207,15 @@ def run_for_member(member, report, *, deadline, now=None, gmail=None) -> None:
     jobs = schedule_svc.claim_due(
         member, agent_id=executor_id(), limit=CLAIM_LIMIT, now=now
     )
+    mine = 0
     for job in jobs:
         report.jobs += 1
-        remaining = TICK_MAX_MAILS - report.sent
+        # Whichever runs out first: the tick's budget or this member's share of
+        # it. The second is what stops one queue starving the rest.
+        remaining = min(
+            TICK_MAX_MAILS - report.sent,
+            PER_MEMBER_TICK_MAILS - mine,
+        )
 
         try:
             result = run_job(
@@ -201,6 +233,7 @@ def run_for_member(member, report, *, deadline, now=None, gmail=None) -> None:
 
         report.sent += result["sent"]
         report.skipped += result["skipped"]
+        mine += result["sent"]
         if result["error"]:
             report.errors.append(f"job {job.id}: {result['error']}")
 
@@ -213,6 +246,10 @@ def run_for_member(member, report, *, deadline, now=None, gmail=None) -> None:
 
         if timezone.now() >= deadline or report.sent >= TICK_MAX_MAILS:
             report.stopped_early = True
+            return
+        if mine >= PER_MEMBER_TICK_MAILS:
+            # This member has had their share. Not stopped_early -- the tick
+            # itself is fine and moves on to the next member.
             return
 
 
@@ -229,7 +266,7 @@ def tick(*, now=None, max_seconds=TICK_MAX_SECONDS, gmail_for=None) -> TickRepor
     deadline = now + timedelta(seconds=max_seconds)
     report = TickReport(started_at=now.isoformat())
 
-    for member in sendable_members():
+    for member in sendable_members(now):
         if timezone.now() >= deadline or report.sent >= TICK_MAX_MAILS:
             report.stopped_early = True
             break

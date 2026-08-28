@@ -721,6 +721,13 @@ def gmail_disconnect(request):
 # press one button. Replaces local_agent/templates/index.html.
 
 
+#: How many rows the Send screen draws. The table is for picking a subset; the
+#: whole-queue path is "Send all", which never touches it. Kept well under
+#: Django's DATA_UPLOAD_MAX_NUMBER_FIELDS (1000) so a full manual selection
+#: still posts rather than erroring.
+SEND_TABLE_LIMIT = 500
+
+
 def _send_queue(member, campaign):
     """This member's contacts that are still mailable for this campaign.
 
@@ -771,8 +778,26 @@ def send(request):
         ).footer
 
     if request.method == "POST" and campaign:
-        selected = request.POST.getlist("contact_ids")
         action = request.POST.get("action")
+
+        # "Send all" resolves the queue on the server rather than trusting a
+        # form to carry it. Two reasons, and the second is not cosmetic:
+        #
+        #   - It is the difference between one click and eight hundred. A member
+        #     whose whole assigned list is the thing they want to mail should not
+        #     have to select it, and the screen truncates its table anyway.
+        #   - Django's DATA_UPLOAD_MAX_NUMBER_FIELDS is 1000. Posting a checkbox
+        #     per contact means a member with a four-figure list gets a
+        #     TooManyFieldsSent error instead of a send -- and that ceiling
+        #     arrives exactly when the feature starts being useful.
+        #
+        # _send_queue is the same function that produced the count on the page,
+        # so "Send all 800" cannot disagree with what 800 meant.
+        if action in ("send_all", "preflight_all"):
+            selected = [str(pk) for pk in queue.values_list("id", flat=True)]
+            action = "send" if action == "send_all" else "preflight"
+        else:
+            selected = request.POST.getlist("contact_ids")
 
         if not selected:
             messages.error(request, "Select at least one contact.")
@@ -827,8 +852,11 @@ def send(request):
         request,
         campaigns=campaigns,
         campaign=campaign,
-        queue=queue[:500],
+        # A picker now, not the send path -- "Send all" never reads this list.
+        # Still bounded: rendering four figures of table rows is its own problem.
+        queue=queue[:SEND_TABLE_LIMIT],
         queue_total=queue.count() if campaign else 0,
+        table_limit=SEND_TABLE_LIMIT,
         preflight=preflight,
         my_footer_text=my_footer_text,
         gmail_connected=gmail_svc.has_usable_credential(request.member),
