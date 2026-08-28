@@ -797,7 +797,7 @@ replaces the rows and would otherwise take the listeners with them.
 | `/campaigns/` | List with sent/failed counts | any member |
 | `/campaigns/<id>/` | Funnel, live preview, status transitions | any member |
 | `/campaigns/new/` · `/campaigns/<id>/edit/` | Template editor: placeholder validation, **Insert link**, HTML toggle | **lead** |
-| `/schedules/` | Every scheduled send; `missed`/`failed` called out, lead-only cancel | member |
+| `/schedules/` | Every scheduled send; `missed`/`failed` called out; **Send queued mail now** for any member, lead-only cancel | member |
 | `/send/` | Your queue for a campaign → dry run → **Send** | any member |
 | `/campaigns/<id>/footer/` | Your own sign-off on a campaign | any member |
 | `/teams/` | The teams you are on | any member |
@@ -1006,7 +1006,7 @@ Something must then drain the queue. Two doors, one code path
 
 | | |
 |---|---|
-| **Send queued mail now** on `/schedules/` | lead-only, POST, what the team actually uses |
+| **Send queued mail now** on `/schedules/` | **any member**, POST — what the team actually uses |
 | `manage.py run_tick` | the same function from a shell, for local runs |
 
 A tick is bounded — `TICK_MAX_MAILS` (40) and `TICK_MAX_SECONDS` (45) — so it
@@ -1020,7 +1020,12 @@ once: `claim_due` uses `SELECT … FOR UPDATE SKIP LOCKED`, and
 > **deferred**. Nothing about it changes the queue, the lease protocol or
 > `tick()` itself; it adds a door and a lock in front of an executor that
 > already exists and is already tested. Until it lands, mail leaves the building
-> when a lead presses the button. See [§23](#23-known-gaps).
+> when *somebody* presses the button — any member, not just a lead. That widening
+> is not a convenience: while the scheduler is deferred this button **is** the
+> send path, and gating it on a role meant a member pressed Send, watched their
+> mail sit in `queued`, and had no way to move it. It grants no new power —
+> `tick()` sends each job with its own owner's Gmail credential — and leads keep
+> the brake (cancel a job, pause the root). See [§23](#23-known-gaps).
 
 ---
 
@@ -1115,7 +1120,7 @@ ignite: tests pinned to localhost:5432/ignite_crm (never the hosted database)
 ```
 
 Verified by running the suite with `DATABASE_URL` pointed at a fake Supabase
-host: all 311 tests still pass against localhost.
+host: all 317 tests still pass against localhost.
 
 ---
 
@@ -1272,8 +1277,8 @@ The entrypoint is the release step: it waits for Postgres, migrates, and runs
 
 ### Not yet automatic
 
-**Queued mail does not send on its own.** A lead presses **Send queued mail now**
-on `/schedules/`. The automatic scheduler — an authenticated tick endpoint, a
+**Queued mail does not send on its own.** Somebody presses **Send queued mail
+now** on `/schedules/` — any member may, and it is safe to press twice. The automatic scheduler — an authenticated tick endpoint, a
 session-level advisory lock, and an external pinger every 1–2 minutes — is
 designed but not deployed; see `docs/MAIL_SCHEDULING.md`. The ping interval is a
 *throughput* setting, not just a keep-alive one, so read that before choosing it.
@@ -1286,7 +1291,7 @@ designed but not deployed; see `docs/MAIL_SCHEDULING.md`. The ping interval is a
 .venv/bin/python -m pytest          # needs docker compose up
 ```
 
-**311 tests**, all passing:
+**317 tests**, all passing:
 
 | File | Count | Covers |
 |---|---|---|
@@ -1304,6 +1309,7 @@ designed but not deployed; see `docs/MAIL_SCHEDULING.md`. The ping interval is a
 | `test_send_recovery.py` | 9 | the 19 Aug incident: chunking, retry, no double-send |
 | `test_bootstrap.py` | 14 | `bootstrap_team` — the first team, and every re-run of it |
 | `test_oauth_pkce.py` | 6 | the PKCE verifier surviving between two requests |
+| `test_run_queue_permission.py` | 6 | that draining the queue stays open to every member |
 
 `test_mailing.py` used to be `test_mailing_api.py`, driven through the token API
 the laptop agent spoke. Only the tests genuinely *about* the API — bearer-token
@@ -1496,7 +1502,7 @@ ignite_crm/
 │       │                          seed_dev.py, stranded_drafts.py
 │       ├── migrations/            0001 … 0015_revoke_api_tokens
 │       ├── templates/crm/         22 templates
-│       └── tests/                 311 tests, incl. conftest.py
+│       └── tests/                 317 tests, incl. conftest.py
 │
 └── render.yaml                    the hosting blueprint
 ```

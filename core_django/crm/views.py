@@ -817,8 +817,9 @@ def send(request):
                 # being restarted.
                 messages.success(
                     request,
-                    f"{job.total} mail(s) queued. They send from your Gmail "
-                    f"shortly — this page does not need to stay open.",
+                    f"{job.total} mail(s) queued. Nothing sends on its own yet "
+                    f"— press “Send queued mail now” below to send them from "
+                    f"your Gmail.",
                 )
                 return redirect("crm:schedule_list")
 
@@ -981,7 +982,7 @@ def team_distribute(request, pk):
     ))
 
 
-@lead_required
+@member_required
 @require_POST
 def run_queue(request):
     """Drain the queued sends now, from the browser.
@@ -992,7 +993,22 @@ def run_queue(request):
     building. When the tick endpoint and an external pinger land, this stays as
     the manual override.
 
-    Safe to press twice, and safe for two leads to press at once, which is why
+    `@member_required`, not `@lead_required`, and that is the point. While the
+    scheduler is deferred this button IS the send path: gating it on a role
+    meant a member pressed Send, watched their own mail sit in `queued`, and
+    waited for a lead to log in and press a second button on a different screen.
+    Nobody reads that as "the queue is fine", they read it as "sending is
+    broken" — and they were half right, because nothing was going to send.
+
+    Widening it grants no power a member did not already have. `tick()` sends
+    each job through `sendable_members()`, using **that job's owner's** Gmail
+    credential; there is no path by which pressing this makes mail leave your
+    mailbox under someone else's name, or someone else's mailbox under yours.
+    What a member gains is the ability to execute work the team has already
+    queued and approved. What a lead keeps is the brake: cancelling a job, and
+    pausing the root campaign, both still stop it.
+
+    Safe to press twice, and safe for two people to press at once, which is why
     it needs no lock: `claim_due` leases with `select_for_update(skip_locked)`
     so a second run sees nothing rather than blocking, and even if both somehow
     reached the same job, `uniq_root_campaign_contact` still stands between them

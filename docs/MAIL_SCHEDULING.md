@@ -112,8 +112,9 @@ meaning anything without it. The tick loops over members instead.
 
 ### What is not built yet
 
-`tick()` has two doors today — the lead-only **Send queued mail now** button on
-`/schedules/`, and `manage.py run_tick`. Both are manual. **Nothing runs it on a
+`tick()` has two doors today — the **Send queued mail now** button on
+`/schedules/`, which any member may press, and `manage.py run_tick`. Both are
+manual. **Nothing runs it on a
 timer**, so a due job waits until a human presses something.
 
 Closing that is a deliberately small, deliberately deferred piece of work:
@@ -363,7 +364,7 @@ Nothing is on a timer (§2). Two doors, one code path:
 
 | | |
 |---|---|
-| **Send queued mail now** on `/schedules/` | lead-only, POST — what the team uses |
+| **Send queued mail now** on `/schedules/` | any member, POST — what the team uses |
 | `manage.py run_tick` | the same function from a shell, for local work |
 
 ```bash

@@ -2,29 +2,29 @@
 {% block title %}Scheduled sends — Ignite CRM{% endblock %}
 {% block heading %}Scheduled sends{% endblock %}
 
+{# Every member, not just leads. While the scheduler is deferred this button
+   is the send path, and a member who cannot press it cannot send at all. See
+   views.run_queue for why widening it grants no new power. #}
 {% block actions %}
-  {% if is_lead %}
-    <form method="post" action="{% url 'crm:run_queue' %}">
-      {% csrf_token %}
-      <button type="submit" class="btn btn-sm">Send queued mail now</button>
-    </form>
-  {% endif %}
+  <form method="post" action="{% url 'crm:run_queue' %}">
+    {% csrf_token %}
+    <button type="submit" class="btn btn-sm">Send queued mail now</button>
+  </form>
 {% endblock %}
 
 {% block content %}
 
-{% if is_lead %}
-  <div class="alert mb-3">
-    <section>
-      <p class="text-sm">
-        <strong>Queued mail does not send on its own yet.</strong> Press
-        <em>Send queued mail now</em> above to work through everything due.
-        The automatic scheduler is not deployed; until it is, this button is how
-        mail leaves the building.
-      </p>
-    </section>
-  </div>
-{% endif %}
+<div class="alert mb-3">
+  <section>
+    <p class="text-sm">
+      <strong>Queued mail does not send on its own yet.</strong> Press
+      <em>Send queued mail now</em> above to work through everything due —
+      anyone on the team may press it, and it is safe to press twice. The
+      automatic scheduler is not deployed; until it is, this button is how mail
+      leaves the building.
+    </p>
+  </section>
+</div>
 
 {# Attention first. A job nothing executed is the failure mode this whole page
    exists for, and burying it under a paginated table would defeat the point. #}
@@ -42,8 +42,9 @@
         {% endfor %}
       </ul>
       <p class="text-xs mt-1">
-        A send only goes out while an agent is running for that member. Nothing
-        listening when it fell due means nothing was sent.
+        Nothing drains the queue on a timer yet, so a job stays due until
+        somebody presses <em>Send queued mail now</em>. A job still stuck after
+        that has a real error — read it above.
       </p>
     </section>
   </div>

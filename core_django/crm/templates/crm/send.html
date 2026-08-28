@@ -123,6 +123,16 @@
             </button>
           </div>
 
+          {# Said here rather than discovered on the next screen. Send queues;
+             the queue is drained by a button. Two steps is surprising, and a
+             member who does not know that reads "queued" as "broken". #}
+          <p class="text-sm muted">
+            <strong>Send queues the mail, it does not send it.</strong> You land
+            on <a href="{% url 'crm:schedule_list' %}">Scheduled sends</a> next
+            — press <em>Send queued mail now</em> there to send it from your
+            Gmail. There is no time-of-day restriction; any hour works.
+          </p>
+
           <details>
             <summary class="text-sm muted">Copy addresses (CC / BCC)</summary>
             <div class="row mt-1" style="gap:.5rem">
