@@ -81,6 +81,13 @@ services:
       - key: DAILY_SEND_CAP
         value: "800"
 
+      # Shared secret for GET /internal/tick. Without it that route answers 503
+      # and NOTHING SENDS ON A TIMER -- queued mail waits for somebody to press
+      # the button. check_db prints a warning at boot when it is missing.
+      #   python -c 'import secrets; print(secrets.token_urlsafe(32))'
+      - key: TICK_SECRET
+        sync: false
+
       # Must exceed the longest gap the pinger's window can create. With the
       # pinger on 10:00-17:00 IST that gap is 17 hours (17:00 to 10:00), so a
       # 6-hour grace marks every evening's queue MISSED before dawn.

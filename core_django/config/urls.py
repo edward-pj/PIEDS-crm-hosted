@@ -1,7 +1,7 @@
 from django.contrib import admin
 from django.urls import include, path
 
-from crm import auth_views
+from crm import auth_views, tick_views
 
 from . import health
 
@@ -11,6 +11,11 @@ urlpatterns = [
 
     # Unauthenticated by design; see config/health.py.
     path("healthz", health.healthz, name="healthz"),
+
+    # The scheduler's door. Authenticated by a shared secret in a header, NOT by
+    # a session and NOT by an ApiToken -- see crm/tick_views.py for why. Kept at
+    # the top level beside /healthz because it is infrastructure, not a screen.
+    path("internal/tick", tick_views.tick, name="internal_tick"),
 
     path("login/", auth_views.login_page, name="login"),
     # NOTE: there is deliberately no password-free "pick your name" route here.

@@ -11,6 +11,8 @@ from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 from django.db import connection
 
+from crm.services.runner import TICK_LOCK_KEY
+
 #: (table, index name, why it matters)
 REQUIRED_INDEXES = [
     (
@@ -138,8 +140,31 @@ class Command(BaseCommand):
             if str(port) == "6543" and not getattr(settings, "DISABLE_SERVER_SIDE_CURSORS", False):
                 failures.append(
                     "Port 6543 is Supabase's TRANSACTION pooler. Either switch to the "
-                    "session pooler on 5432, or set DB_TRANSACTION_POOLER=True."
+                    "session pooler on 5432, or set DB_TRANSACTION_POOLER=True. This "
+                    "now guards the SCHEDULER as well as the send path: session "
+                    "advisory locks are broken on a transaction pooler, because the "
+                    "lock is taken on one pooled backend and the next statement runs "
+                    "on another. There is no error -- two ticks simply run at once."
                 )
+
+            # Prove the tick's mutual exclusion actually works on THIS
+            # connection. A lock that silently never blocks is worse than none:
+            # the code reads as if double-execution is handled.
+            try:
+                cur.execute("SELECT pg_try_advisory_lock(%s)", [TICK_LOCK_KEY])
+                got = cur.fetchone()[0]
+                cur.execute("SELECT pg_advisory_unlock(%s)", [TICK_LOCK_KEY])
+                if got:
+                    self.stdout.write(
+                        self.style.SUCCESS("  ok     pg_try_advisory_lock")
+                    )
+                else:
+                    failures.append(
+                        "pg_try_advisory_lock could not be taken. Something else "
+                        "holds the tick lock, or advisory locks are unavailable."
+                    )
+            except Exception as exc:                       # noqa: BLE001
+                failures.append(f"pg_try_advisory_lock failed: {exc}")
 
             # Prove the lock the send path depends on is actually available.
             try:
@@ -171,6 +196,18 @@ class Command(BaseCommand):
                 )
         except Exception as exc:                           # noqa: BLE001
             failures.append(f"GMAIL_TOKEN_KEY is unusable: {exc}")
+
+        # Not a failure. A deployment can legitimately run without a pinger --
+        # the button still works -- but nothing will send on its own, and that
+        # is worth saying at boot rather than leaving somebody to discover it.
+        if getattr(settings, "TICK_SECRET", ""):
+            self.stdout.write(self.style.SUCCESS("  ok     TICK_SECRET is set"))
+        else:
+            self.stdout.write(self.style.WARNING(
+                "  WARN   TICK_SECRET is not set: /internal/tick answers 503 and "
+                "nothing drains the send queue on a timer. Queued mail waits for "
+                "somebody to press 'Send queued mail now'."
+            ))
 
         if failures:
             raise CommandError(

@@ -230,6 +230,16 @@ SCHEDULE_GRACE_HOURS = env.int("SCHEDULE_GRACE_HOURS", default=20)
 #: window frees; it is a rate limit, never a refusal.
 DAILY_SEND_CAP = env.int("DAILY_SEND_CAP", default=800)
 
+#: Shared secret for GET /internal/tick, the route an external scheduler uses to
+#: drain the send queue. Blank disables the route entirely (503) rather than
+#: leaving it open -- see crm/tick_views.py::tick_enabled.
+#:
+#: Not an ApiToken and not a session: the pinger is not a team member. It can
+#: only start work members already queued, so the blast radius of a leaked
+#: secret is send TIMING, not content. Generate one with:
+#:   python -c 'import secrets; print(secrets.token_urlsafe(32))'
+TICK_SECRET = env("TICK_SECRET", default="")
+
 
 # --- who may sign in ------------------------------------------------------
 # Batch 2024 picks a name; batch 2025 signs in with Google. The reasoning is in

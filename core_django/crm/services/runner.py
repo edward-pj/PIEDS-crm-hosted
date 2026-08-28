@@ -11,12 +11,17 @@ ran the housekeeping on the polling path, with the comment "the housekeeping
 runs as often as the thing it cleans up, with no extra process to keep alive".
 Hosting only changes who polls.
 
-**Phase 1 ships the executor; the door and the lock arrive with the scheduler
-phase.** Today `tick()` is reached only by `manage.py run_tick`, which is enough
-to drain the queue on a machine someone is looking at. What it deliberately does
-NOT yet do -- and must, before this runs on a platform with several workers --
-is take the advisory lock that stops two overlapping ticks, sweep expired leases
-and missed jobs, and run the follow-up rules. Until then, run one tick at a time.
+`tick()` now has three doors and one code path: `GET /internal/tick` for the
+external pinger (see crm/tick_views.py), the **Send queued mail now** button for
+a human who does not want to wait a minute, and `manage.py run_tick` locally. It
+holds a session-level advisory lock, so those three racing each other is normal
+rather than a double-send, and it runs the lease and missed sweeps that used to
+ride the laptop agent's polling loop.
+
+Reply detection and the follow-up rules are still NOT run here. They were left
+out deliberately rather than forgotten: they need the Gmail readonly path inside
+a bounded request, and nothing about adding them later changes the queue, the
+lock, or this file's shape.
 
 An in-process background thread was considered and rejected: `AppConfig.ready()`
 runs in every gunicorn worker (so three workers means three schedulers racing),
@@ -32,6 +37,7 @@ import socket
 from dataclasses import dataclass, field
 from datetime import timedelta
 
+from django.db import connection
 from django.utils import timezone
 
 from crm.models import GmailCredential, TeamMember
@@ -62,6 +68,10 @@ TICK_MAX_SECONDS = 45
 #: sendable_members() decides which four.
 PER_MEMBER_TICK_MAILS = 10
 
+#: Advisory lock namespace. Arbitrary, but it must be stable across deploys and
+#: not collide with anything else in the database.
+TICK_LOCK_KEY = 8412026
+
 
 @dataclass
 class TickReport:
@@ -74,6 +84,11 @@ class TickReport:
     skipped: int = 0
     errors: list = field(default_factory=list)
     stopped_early: bool = False
+    #: Another tick held the lock. Normal and expected -- two pingers and a
+    #: button all reach the same function -- so it is reported, not an error.
+    locked: bool = False
+    leases_recovered: int = 0
+    marked_missed: int = 0
 
     def dict(self):
         return {
@@ -84,7 +99,33 @@ class TickReport:
             "skipped": self.skipped,
             "errors": self.errors[:10],
             "stopped_early": self.stopped_early,
+            "locked": self.locked,
+            "leases_recovered": self.leases_recovered,
+            "marked_missed": self.marked_missed,
         }
+
+
+def _try_lock() -> bool:
+    """Take the tick lock, or report that somebody else has it.
+
+    SESSION-level, not `pg_try_advisory_xact_lock`. The transactional variant
+    would require the whole tick inside one transaction, which is impossible:
+    claim_batch commits PER CONTACT on purpose so a crash can never leave a sent
+    mail with no record. **Never wrap tick() in @transaction.atomic.**
+
+    Note this is re-entrant within one connection -- Postgres counts session
+    locks per session -- so it does not protect a single process from itself.
+    It is not meant to: the hazard is two gunicorn workers, which have separate
+    connections and share no memory.
+    """
+    with connection.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock(%s)", [TICK_LOCK_KEY])
+        return bool(cur.fetchone()[0])
+
+
+def _unlock() -> None:
+    with connection.cursor() as cur:
+        cur.execute("SELECT pg_advisory_unlock(%s)", [TICK_LOCK_KEY])
 
 
 def executor_id() -> str:
@@ -253,18 +294,54 @@ def run_for_member(member, report, *, deadline, now=None, gmail=None) -> None:
             return
 
 
-def tick(*, now=None, max_seconds=TICK_MAX_SECONDS, gmail_for=None) -> TickReport:
+def tick(*, now=None, max_seconds=TICK_MAX_SECONDS, gmail_for=None,
+         lock=True) -> TickReport:
     """One pass over everything that is due.
 
     Every failure mode is per-member and per-job: one broken credential must not
     stop the others, and must not stop the next tick either.
 
+    Guarded by a session-level advisory lock, which is mandatory rather than
+    defensive: the app runs two gunicorn workers, two pingers point at the same
+    endpoint, and any member may also press the button. Losing the race is
+    normal and returns an empty report with `locked` set -- that is exactly what
+    makes running a second pinger safe.
+
     `gmail_for` is a hook for tests -- a callable taking a member and returning
-    a client. Production passes nothing.
+    a client. `lock=False` is for tests that need two overlapping runs on one
+    connection, where the lock is re-entrant and would not block anyway.
+    Production passes neither.
     """
     now = now or timezone.now()
-    deadline = now + timedelta(seconds=max_seconds)
     report = TickReport(started_at=now.isoformat())
+
+    if lock and not _try_lock():
+        report.locked = True
+        return report
+    try:
+        _run(report, now=now, max_seconds=max_seconds, gmail_for=gmail_for)
+    finally:
+        if lock:
+            _unlock()
+    return report
+
+
+def _run(report, *, now, max_seconds, gmail_for) -> None:
+    deadline = now + timedelta(seconds=max_seconds)
+
+    # Housekeeping first, and inside the same lock. sweep_expired_leases returns
+    # jobs whose executor died mid-batch; sweep_missed states, rather than
+    # silently drops, the ones nothing ran in time. Both used to ride the laptop
+    # agent's polling loop and have had nothing to run them since it was
+    # retired, which is why a stranded job stayed stranded.
+    try:
+        report.leases_recovered = schedule_svc.sweep_expired_leases(now=now)
+        report.marked_missed = schedule_svc.sweep_missed(now=now)
+    except Exception as exc:                                    # noqa: BLE001
+        # Housekeeping failing must not stop the sending. It is the cheaper
+        # half of the tick and the next one runs in sixty seconds.
+        log.exception("tick housekeeping failed")
+        report.errors.append(f"housekeeping: {type(exc).__name__}: {exc}")
 
     for member in sendable_members(now):
         if timezone.now() >= deadline or report.sent >= TICK_MAX_MAILS:
@@ -280,5 +357,3 @@ def tick(*, now=None, max_seconds=TICK_MAX_SECONDS, gmail_for=None) -> TickRepor
         except Exception as exc:                                # noqa: BLE001
             log.exception("tick failed for %s", member.bits_email)
             report.errors.append(f"{member.bits_email}: {type(exc).__name__}: {exc}")
-
-    return report

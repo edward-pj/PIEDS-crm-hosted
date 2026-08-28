@@ -1015,11 +1015,13 @@ def team_distribute(request, pk):
 def run_queue(request):
     """Drain the queued sends now, from the browser.
 
-    **This is a stand-in for the scheduler, not the scheduler.** The hosted plan
-    has no shell, so `manage.py run_tick` cannot be run on the deployed instance
-    at all — without this button, queued mail would have no way to leave the
-    building. When the tick endpoint and an external pinger land, this stays as
-    the manual override.
+    **The manual override, not the scheduler.** An external pinger calls
+    `/internal/tick` every minute during its window and that is what normally
+    moves mail. This button is for the rest: sending outside the window, and
+    proving the queue works without waiting a minute to find out.
+
+    It takes the same advisory lock as the pinger, so pressing it during a tick
+    reports that rather than starting a second one.
 
     `@member_required`, not `@lead_required`, and that is the point. While the
     scheduler is deferred this button IS the send path: gating it on a role
@@ -1048,7 +1050,15 @@ def run_queue(request):
     """
     report = runner.tick()
 
-    if report.jobs == 0:
+    if report.locked:
+        # The scheduler is mid-tick. Saying "nothing was due" here would be a
+        # lie, and the member would press again and see the same thing.
+        messages.info(
+            request,
+            "The scheduler is already sending right now — your mail is on its "
+            "way. Refresh in a moment to watch the progress.",
+        )
+    elif report.jobs == 0:
         messages.info(request, "Nothing was due to send.")
     else:
         messages.success(
