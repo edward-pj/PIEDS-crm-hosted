@@ -67,7 +67,73 @@ STRANDED_AFTER_MINUTES = 15
 
 
 def _base(request, **extra):
-    return {"member": request.member, "is_lead": is_lead(request.member), **extra}
+    return {
+        "member": request.member,
+        "is_lead": is_lead(request.member),
+        # Every list screen renders the same size picker, so the options belong
+        # here rather than in four view signatures. Which one is CURRENT is
+        # deliberately not passed: the template reads `page.paginator.per_page`,
+        # the size actually in force. Computing it a second time here got it
+        # wrong -- each screen carries its own default, so a bare _page_size()
+        # returned 50 while the assign screen was rendering 100, and the picker
+        # underlined a number that did not match the rows underneath it.
+        "page_sizes": PAGE_SIZES,
+        "min_page_size": PAGE_SIZES[0],
+        **extra,
+    }
+
+
+#: Rows per page a lead may choose. 300 is the size that was actually asked
+#: for: somebody who has just imported a few hundred contacts wants to assign
+#: the batch, and doing that fifty at a time is six round trips through a
+#: screen that already carries filters.
+#:
+#: 500 is the ceiling, and it is not arbitrary. Every row on the assign and
+#: contact screens carries a checkbox posted as `contact_ids`, and Django
+#: refuses a POST with more than DATA_UPLOAD_MAX_NUMBER_FIELDS inputs -- as a
+#: bare 400, not as anything a user could act on. See that setting in
+#: settings.py, which is pinned against this tuple.
+PAGE_SIZES = (50, 100, 300, 500)
+
+#: Where the choice is remembered. A lead who picks 300 on the contact list and
+#: clicks through to Assign means it there too; asking again on every screen is
+#: the same complaint in a different place.
+PAGE_SIZE_SESSION_KEY = "page_size"
+
+
+def _page_size(request, default=None):
+    """Rows per page: what the URL asks for, else the last choice, else `default`.
+
+    A `per_page` that is unparseable or not on the menu falls back rather than
+    raising. It arrives from a hand-edited URL or a stale bookmark, and a 500 is
+    a poor answer to a typo -- while honouring an arbitrary number would let
+    `?per_page=100000` render the whole pool into one page.
+    """
+    raw = request.GET.get("per_page")
+    if raw:
+        try:
+            size = int(raw)
+        except (TypeError, ValueError):
+            size = None
+        if size in PAGE_SIZES:
+            request.session[PAGE_SIZE_SESSION_KEY] = size
+            return size
+
+    remembered = request.session.get(PAGE_SIZE_SESSION_KEY)
+    if remembered in PAGE_SIZES:
+        return remembered
+    return default if default is not None else PAGE_SIZES[0]
+
+
+def _paginate(request, qs, default=None):
+    """One page of `qs`, at whatever size this user is working at.
+
+    `default` is the size the screen used before it was choosable, so a screen
+    that was showing 100 keeps showing 100 until somebody asks for otherwise.
+    """
+    return Paginator(qs, _page_size(request, default)).get_page(
+        request.GET.get("page")
+    )
 
 
 # ---------------------------------------------------------------- dashboard
@@ -181,7 +247,7 @@ def _filter_context(request):
 @member_required
 def contact_list(request):
     qs, ctx = _filter_context(request)
-    page = Paginator(qs, 50).get_page(request.GET.get("page"))
+    page = _paginate(request, qs, default=50)
     return render(request, "crm/contact_list.html", _base(
         request,
         page=page,
@@ -357,7 +423,7 @@ def assign(request):
     # A page that slow is not just unpleasant, it broke selection outright (the
     # background refresh landed mid-click and rolled the ticks back).
     qs = qs.annotate(mailed=Count("mailings", distinct=True))
-    page = Paginator(qs, 100).get_page(request.GET.get("page"))
+    page = _paginate(request, qs, default=100)
     return render(request, "crm/assign.html", _base(request, page=page, total=qs.count(), **ctx))
 
 
@@ -555,7 +621,7 @@ def campaign_detail(request, pk):
 
     return render(request, "crm/campaign_detail.html", _base(
         request, campaign=campaign, counts=counts,
-        mailings=Paginator(mailings, 100).get_page(request.GET.get("page")),
+        mailings=_paginate(request, mailings, default=100),
         assigned_pool=Contact.objects.filter(assigned_to__isnull=False).count(),
         preview=preview, preview_error=preview_error, sample=sample,
         stranded_members=(
@@ -648,7 +714,7 @@ def schedule_list(request):
 
     return render(request, "crm/schedule_list.html", _base(
         request,
-        page=Paginator(jobs, 50).get_page(request.GET.get("page")),
+        page=_paginate(request, jobs, default=50),
         needs_attention=needs_attention,
         statuses=ScheduleStatus.choices(),
         current_status=status,

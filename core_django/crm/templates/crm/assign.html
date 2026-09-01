@@ -83,20 +83,36 @@
   const chosen = () => picks().filter(p => p.checked);
 
   function sync() {
-    const n = chosen().length;
+    const all = picks(), n = chosen().length;
     document.getElementById('count').textContent = n;
     document.getElementById('assignBtn').disabled = n === 0;
     document.getElementById('unassignBtn').disabled = n === 0;
-    picks().forEach(p => p.closest('tr').classList.toggle('is-selected', p.checked));
+    all.forEach(p => p.closest('tr').classList.toggle('is-selected', p.checked));
+
+    // Looked up fresh, never held in a variable: the poll swap replaces this
+    // element, and a reference captured at load would be pointing at a node
+    // that is no longer in the document.
+    const master = document.getElementById('selectAll');
+    if (master) {
+      master.checked = n > 0 && n === all.length;
+      master.indeterminate = n > 0 && n < all.length;
+    }
   }
 
-  document.getElementById('selectAll').addEventListener('change', e => {
-    picks().forEach(p => p.checked = e.target.checked);
-    sync();
+  // Delegated, exactly like the row boxes below and for the same reason. This
+  // header box sits INSIDE the [data-poll] region, so a background refresh
+  // replaces it -- and a listener bound straight to the old element went with
+  // it. That is the whole of "select all stops working sometimes": it worked
+  // until the first refresh landed, roughly twenty seconds in or the moment
+  // you came back to the tab, and never again until a reload.
+  document.addEventListener('change', e => {
+    if (e.target.id === 'selectAll') {
+      picks().forEach(p => p.checked = e.target.checked);
+      sync();
+    } else if (e.target.matches('.pick')) {
+      sync();
+    }
   });
-  // Delegated, not bound per row: a background refresh replaces the rows and
-  // would otherwise drop the listeners with them.
-  document.addEventListener('change', e => { if (e.target.matches('.pick')) sync(); });
   document.addEventListener('poll:refreshed', sync);
 
   document.getElementById('assignForm').addEventListener('submit', e => {

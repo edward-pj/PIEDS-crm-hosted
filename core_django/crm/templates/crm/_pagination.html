@@ -1,11 +1,53 @@
-{% if page.paginator.num_pages > 1 %}
-<nav class="row mt-2" style="justify-content:center">
-  {% if page.has_previous %}
-    <a class="btn-outline btn-sm" href="?{{ request.GET.urlencode }}&page={{ page.previous_page_number }}">Previous</a>
+{% comment %}
+Page navigation and the rows-per-page picker, for every list screen.
+
+The links use {% templatetag openblock %} querystring {% templatetag closeblock %}
+(a Django 5.1 builtin) rather than `?{{ request.GET.urlencode }}&page=N`, which
+is what this used to do. That form re-appended `page` to a query string that
+already contained one, so clicking Next three times produced
+`?page=2&page=3&page=4`. It happened to render the right page -- Django reads
+the last value -- while the URL grew on every click and became useless to share
+or bookmark. The tag REPLACES a key instead of appending it.
+
+Changing the page size resets `page` to the first page on purpose: page 7 of 50
+is not page 7 of 300, and landing past the end after switching is how a picker
+looks broken.
+
+Which size is current comes from `page.paginator.per_page` -- the size actually
+in force -- and never from a value passed alongside it. Each screen carries its
+own default, so a separately-computed "current" disagreed with the rows on the
+page: Assign rendered 100 and the picker underlined 50.
+{% endcomment %}
+
+{% if page.paginator.count > min_page_size %}
+<nav class="row wrap mt-2" style="justify-content:center;gap:1rem">
+
+  {% if page.paginator.num_pages > 1 %}
+    <span class="row" style="gap:.5rem">
+      {% if page.has_previous %}
+        <a class="btn-outline btn-sm" href="{% querystring page=page.previous_page_number %}">Previous</a>
+      {% endif %}
+      <span class="text-sm muted">
+        Page {{ page.number }} of {{ page.paginator.num_pages }}
+        <span class="text-xs">({{ page.paginator.count }} total)</span>
+      </span>
+      {% if page.has_next %}
+        <a class="btn-outline btn-sm" href="{% querystring page=page.next_page_number %}">Next</a>
+      {% endif %}
+    </span>
   {% endif %}
-  <span class="text-sm muted">Page {{ page.number }} of {{ page.paginator.num_pages }}</span>
-  {% if page.has_next %}
-    <a class="btn-outline btn-sm" href="?{{ request.GET.urlencode }}&page={{ page.next_page_number }}">Next</a>
-  {% endif %}
+
+  <span class="row text-sm muted" style="gap:.4rem">
+    <span class="text-xs">Per page</span>
+    {% for size in page_sizes %}
+      {% if size == page.paginator.per_page %}
+        <span class="btn-sm" aria-current="true"
+              style="font-weight:600;text-decoration:underline">{{ size }}</span>
+      {% else %}
+        <a class="btn-ghost btn-sm" href="{% querystring per_page=size page=None %}">{{ size }}</a>
+      {% endif %}
+    {% endfor %}
+  </span>
+
 </nav>
 {% endif %}

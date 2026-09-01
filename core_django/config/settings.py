@@ -154,6 +154,17 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 #: than an incidental one. A 2.5 MB CSV is roughly 20,000 contacts.
 DATA_UPLOAD_MAX_MEMORY_SIZE = env.int("DATA_UPLOAD_MAX_MEMORY_SIZE", default=2621440)
 
+#: Inputs per POST. Django's own default is 1000, and the assign and contact
+#: screens post one checkbox per visible row -- so this is the real ceiling on
+#: how many contacts a lead may see and act on at once, and it is coupled to
+#: views.PAGE_SIZES whether or not anyone remembers. The failure mode is why it
+#: is written down: exceeding it is a bare 400 with no message, on the screen
+#: where somebody just ticked five hundred boxes.
+#:
+#: 2000 leaves room for the largest page size (500) several times over. Raising
+#: PAGE_SIZES past that without raising this brings the 400 back.
+DATA_UPLOAD_MAX_NUMBER_FIELDS = env.int("DATA_UPLOAD_MAX_NUMBER_FIELDS", default=2000)
+
 #: Render captures stdout and nothing else; without this there is no application
 #: logging at all in production, and a swallowed exception leaves no trace.
 LOGGING = {

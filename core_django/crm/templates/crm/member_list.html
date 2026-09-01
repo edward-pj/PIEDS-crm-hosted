@@ -24,8 +24,9 @@
               <tr class="{% if not m.is_active %}is-disabled{% endif %}">
                 <td class="font-medium">{{ m.name }}</td>
                 <td class="text-sm muted">{{ m.bits_email }}</td>
-                {# Batch used to be shown here and used to decide permissions.
-                   It decides nothing now; whether they can actually send does. #}
+                {% comment %} Batch used to be shown here and used to decide permissions.
+                   It decides nothing now; whether they can actually send does.
+{% endcomment %}
                 <td>
                   {% if m.gmail_connected %}
                     <span class="badge">connected</span>

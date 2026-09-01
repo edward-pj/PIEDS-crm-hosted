@@ -10,6 +10,13 @@ when the feature starts being worth having.
 `_send_queue`, the same function that produced the count printed on the page.
 These tests pin that the two cannot disagree, and that resolving server-side
 did not become a way to mail somebody else's contacts.
+
+`TestSendingOnlySome` is the counterweight, and it exists because the first
+version of this screen went too far the other way: every row box rendered
+`checked` and the selective buttons were folded into a collapsed <details>, so
+"mail everyone assigned to me" was what happened if you did nothing, and mailing
+two people meant un-ticking several hundred boxes. Both paths have to stay one
+click, and neither may be the accidental one.
 """
 
 import pytest
@@ -181,3 +188,115 @@ class TestSelectiveSendStillWorks:
         })
 
         assert ScheduledSend.objects.get().total == 3
+
+
+class TestSendingOnlySome:
+    """Picking a couple of contacts has to mail exactly those couple.
+
+    The server was never the problem -- `action=send` has always used whatever
+    `contact_ids` it was handed. The screen was: boxes shipped pre-ticked, so
+    the default state of the form was "everyone", and the buttons that honour a
+    selection were hidden behind a <details>.
+    """
+
+    def test_two_selected_contacts_queue_two_mails(self, client, sender, campaign):
+        contacts = assign(sender, 25)
+        sign_in(client, sender)
+        picked = contacts[:2]
+
+        client.post(reverse("crm:send"), {
+            "campaign": str(campaign.id),
+            "action": "send",
+            "contact_ids": [str(c.id) for c in picked],
+        })
+
+        job = ScheduledSend.objects.get()
+        assert job.total == 2
+        # contact_ids round-trips through JSON as UUIDs, not strings.
+        assert {str(cid) for cid in job.contact_ids} == {str(c.id) for c in picked}
+
+    def test_one_selected_contact_queues_one_mail(self, client, sender, campaign):
+        contacts = assign(sender, 25)
+        sign_in(client, sender)
+
+        client.post(reverse("crm:send"), {
+            "campaign": str(campaign.id), "action": "send",
+            "contact_ids": [str(contacts[7].id)],
+        })
+
+        job = ScheduledSend.objects.get()
+        assert job.total == 1
+        assert [str(cid) for cid in job.contact_ids] == [str(contacts[7].id)]
+
+    def test_a_selection_does_not_quietly_become_everyone(
+        self, client, sender, campaign
+    ):
+        """The failure this screen actually produced. Anything that widens a
+        two-contact selection to the whole assigned list is the bug."""
+        assign(sender, 40)
+        sign_in(client, sender)
+        chosen = [str(c.id) for c in Contact.objects.filter(assigned_to=sender)[:2]]
+
+        client.post(reverse("crm:send"), {
+            "campaign": str(campaign.id), "action": "send", "contact_ids": chosen,
+        })
+
+        assert ScheduledSend.objects.get().total == 2
+
+    def test_selecting_nothing_sends_nothing(self, client, sender, campaign):
+        assign(sender, 10)
+        sign_in(client, sender)
+
+        client.post(reverse("crm:send"), {
+            "campaign": str(campaign.id), "action": "send",
+        })
+
+        assert not ScheduledSend.objects.exists()
+
+    def test_a_dry_run_of_a_selection_covers_only_that_selection(
+        self, client, sender, campaign
+    ):
+        contacts = assign(sender, 20)
+        sign_in(client, sender)
+
+        response = client.post(reverse("crm:send"), {
+            "campaign": str(campaign.id), "action": "preflight",
+            "contact_ids": [str(c.id) for c in contacts[:3]],
+        })
+
+        assert len(response.context["preflight"]) == 3
+
+
+class TestTheScreenDoesNotPreSelectEveryone:
+    """The template half, which is where the defect actually lived."""
+
+    def test_the_row_boxes_start_empty(self, client, sender, campaign):
+        """Pre-ticked boxes made "send to everyone" the outcome of doing
+        nothing -- the opposite of what a send screen should default to."""
+        assign(sender, 5)
+        sign_in(client, sender)
+
+        body = client.get(reverse("crm:send"), {"campaign": str(campaign.id)}).content.decode()
+        rows = [line for line in body.splitlines() if 'name="contact_ids"' in line]
+
+        assert rows, "no contact rows rendered"
+        for row in rows:
+            assert "checked" not in row, f"row ships pre-ticked: {row.strip()}"
+
+    def test_both_ways_to_send_are_offered_outside_a_disclosure(
+        self, client, sender, campaign
+    ):
+        """Selective send sat inside a collapsed <details>, so the only visible
+        action mailed the whole list. Both are top-level now."""
+        assign(sender, 5)
+        sign_in(client, sender)
+        body = client.get(reverse("crm:send"), {"campaign": str(campaign.id)}).content.decode()
+
+        assert 'value="send"' in body and 'value="send_all"' in body
+
+        # Nothing between a <details> and its </details> may carry the
+        # selective actions.
+        for chunk in body.split("<details>")[1:]:
+            hidden = chunk.split("</details>")[0]
+            assert 'value="send"' not in hidden
+            assert 'value="send_all"' not in hidden
