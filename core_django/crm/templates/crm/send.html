@@ -116,40 +116,10 @@
             </section>
           </div>
 
-          {# The whole point of the screen. "Send all" posts one flag and lets
-             the server re-resolve the queue, so it works at any size and does
-             not care what the table below shows or how many boxes are ticked. #}
-          <div class="row" style="gap:.5rem">
-            <button type="submit" name="action" value="preflight_all"
-                    class="btn btn-outline">
-              Dry run all {{ queue_total }}
-            </button>
-            <button type="submit" name="action" value="send_all" class="btn"
-                    {% if not gmail_connected %}disabled{% endif %}>
-              Send all {{ queue_total }}
-            </button>
-          </div>
-
-          <details>
-            <summary class="text-sm muted">Send only some of them</summary>
-            <div class="row mt-1" style="gap:.5rem">
-              <button type="submit" name="action" value="preflight"
-                      class="btn-outline btn-sm">
-                Dry run selected
-              </button>
-              <button type="submit" name="action" value="send" class="btn-sm btn"
-                      {% if not gmail_connected %}disabled{% endif %}>
-                Send selected
-              </button>
-            </div>
-            <p class="text-sm muted mt-1">
-              Uses the tick boxes in the table below.
-            </p>
-          </details>
-
-          {# Said here rather than discovered on the next screen. Send queues;
+          {% comment %} Said here rather than discovered on the next screen. Send queues;
              the queue is drained by a button. Two steps is surprising, and a
-             member who does not know that reads "queued" as "broken". #}
+             member who does not know that reads "queued" as "broken".
+{% endcomment %}
           <p class="text-sm muted">
             <strong>Send queues the mail, it does not send it.</strong> You land
             on <a href="{% url 'crm:schedule_list' %}">Scheduled sends</a> next
@@ -169,12 +139,57 @@
             </p>
           </details>
 
+          {% comment %} Two ways to send, both one click, neither hidden.
+
+             This used to be "Send all N" as the primary button with the
+             selective pair folded inside a <details>, and every row box
+             rendered `checked`. Mailing two people therefore meant finding a
+             collapsed section and un-ticking several hundred boxes, and the
+             obvious action mailed the entire assigned list. Nothing was broken
+             server-side -- `action=send` has always honoured whatever
+             `contact_ids` it is given -- the screen simply made the wrong thing
+             easy. Boxes now start empty, and picking two is two clicks.
+
+             "Send all" stays a single click because that is what it is for: it
+             posts one flag and lets the server re-resolve the queue, so it
+             works at any size and does not care what the table shows or how
+             many boxes are ticked. It confirms first, because it is the button
+             that can put 800 mails in the queue by accident.
+{% endcomment %}
+          <div class="row wrap" style="gap:.5rem;align-items:center">
+            <button type="submit" name="action" value="send" class="btn"
+                    id="sendSelected" disabled>
+              Send <span data-pick-count>0</span> selected
+            </button>
+            <button type="submit" name="action" value="preflight"
+                    class="btn-outline" id="dryRunSelected" disabled>
+              Dry run <span data-pick-count>0</span> selected
+            </button>
+
+            <span class="text-sm muted" style="margin-left:auto">or</span>
+
+            <button type="submit" name="action" value="send_all"
+                    class="btn-outline" id="sendAll"
+                    {% if not gmail_connected %}disabled{% endif %}>
+              Send all {{ queue_total }}
+            </button>
+            <button type="submit" name="action" value="preflight_all"
+                    class="btn-ghost">
+              Dry run all {{ queue_total }}
+            </button>
+          </div>
+
+          <p class="text-sm muted" id="pickHint">
+            Tick the contacts you want in the table below, or use
+            <em>Send all {{ queue_total }}</em> to mail everyone assigned to you.
+          </p>
+
           <table class="table">
             <thead>
               <tr>
                 <th style="width:2.5rem">
-                  <input type="checkbox" aria-label="Select all"
-                         onclick="for (const b of this.closest('table').querySelectorAll('input[name=contact_ids]')) b.checked = this.checked">
+                  <input type="checkbox" aria-label="Select every contact in this table"
+                         id="pickAll">
                 </th>
                 <th>Contact</th>
                 <th>Company</th>
@@ -182,9 +197,14 @@
               </tr>
             </thead>
             <tbody>
+              {% comment %} NOT `checked`. See the note above the action bar: pre-ticking
+                 every row made "send to everyone" the default outcome of doing
+                 nothing, which is the opposite of what a send screen should
+                 default to.
+{% endcomment %}
               {% for c in queue %}
                 <tr>
-                  <td><input type="checkbox" name="contact_ids" value="{{ c.id }}" checked></td>
+                  <td><input type="checkbox" class="pick" name="contact_ids" value="{{ c.id }}"></td>
                   <td>{{ c.full_name }}</td>
                   <td class="muted text-sm">{{ c.company }}</td>
                   <td class="muted text-sm">{{ c.email }}</td>
@@ -200,4 +220,58 @@
 
 {% endif %}
 
+{% endblock %}
+
+{% block scripts %}
+<script>
+  (function () {
+    const picks = () => [...document.querySelectorAll('.pick')];
+    const sendBtn = document.getElementById('sendSelected');
+    const dryBtn  = document.getElementById('dryRunSelected');
+    if (!sendBtn) return;                       // nothing queued; no table
+
+    const gmailConnected = {% if gmail_connected %}true{% else %}false{% endif %};
+
+    function sync() {
+      const all = picks(), n = all.filter(p => p.checked).length;
+      document.querySelectorAll('[data-pick-count]')
+              .forEach(el => el.textContent = n);
+
+      // Disabled at zero rather than failing server-side with "Select at least
+      // one contact" -- the button should not look available when it is not.
+      sendBtn.disabled = n === 0 || !gmailConnected;
+      dryBtn.disabled = n === 0;
+      all.forEach(p => p.closest('tr').classList.toggle('is-selected', p.checked));
+
+      const master = document.getElementById('pickAll');
+      if (master) {
+        master.checked = n > 0 && n === all.length;
+        master.indeterminate = n > 0 && n < all.length;
+      }
+    }
+
+    document.addEventListener('change', e => {
+      if (e.target.id === 'pickAll') {
+        picks().forEach(p => p.checked = e.target.checked);
+        sync();
+      } else if (e.target.matches('.pick')) {
+        sync();
+      }
+    });
+
+    // The one button here that can queue hundreds of mails without anybody
+    // having chosen a recipient. One confirmation is cheap against that.
+    document.getElementById('sendAll')?.closest('form')
+      ?.addEventListener('submit', e => {
+        if (e.submitter && e.submitter.value === 'send_all') {
+          const total = {{ queue_total }};
+          if (!confirm(`Queue mail to all ${total} contact(s) assigned to you?`)) {
+            e.preventDefault();
+          }
+        }
+      });
+
+    sync();
+  })();
+</script>
 {% endblock %}
