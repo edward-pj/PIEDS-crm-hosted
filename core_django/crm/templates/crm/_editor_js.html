@@ -1,0 +1,63 @@
+{% comment %}
+Toolbar behaviour for the campaign body and the footer. Included by both, for
+the same reason as _editor_help.html: one copy cannot drift from the other.
+
+Deliberately prompt()/confirm() and not a modal: this codebase carries no JS
+framework, and a native dialog is the whole feature in a few lines instead of a
+dialog library.
+{% endcomment %}
+<script>
+  function ignInsert(el, markup, selectFrom, selectLen) {
+    const start = el.selectionStart, end = el.selectionEnd;
+    el.value = el.value.slice(0, start) + markup + el.value.slice(end);
+    el.focus();
+    if (selectLen) {
+      el.selectionStart = start + selectFrom;
+      el.selectionEnd = start + selectFrom + selectLen;
+    } else {
+      el.selectionStart = el.selectionEnd = start + markup.length;
+    }
+  }
+
+  // Wrap the selected words in [text](url). Works with HTML on or off -- the
+  // link syntax is converted in both modes, so there is never a reason to
+  // hand-write an anchor just to get a link.
+  function insertLink(fieldId) {
+    const el = document.getElementById(fieldId);
+    if (!el) return;
+
+    const selected = el.value.slice(el.selectionStart, el.selectionEnd).trim();
+    const url = prompt('Link URL (http://, https://, mailto: or tel:)', 'https://');
+    if (!url) return;
+
+    const label = selected || 'link text';
+    // With nothing selected we invented the label, so leave it selected for the
+    // user to type over rather than dropping the caret past the end of it.
+    ignInsert(el, '[' + label + '](' + url.trim() + ')',
+              1, selected ? 0 : label.length);
+  }
+
+  // An <img> only renders if the HTML box is ticked, so offer to tick it rather
+  // than silently inserting a tag that will go out as visible text -- which is
+  // the exact failure this whole screen was rebuilt to stop.
+  function insertImage(fieldId, htmlBoxId) {
+    const el = document.getElementById(fieldId);
+    if (!el) return;
+
+    const box = document.getElementById(htmlBoxId);
+    if (box && !box.checked) {
+      if (!confirm('Images need HTML turned on, otherwise the tag goes out as '
+                 + 'visible text. Turn it on now?')) return;
+      box.checked = true;
+    }
+
+    const url = prompt('Image URL — must be public on the web (https://...)',
+                       'https://');
+    if (!url) return;
+
+    const markup = '<img src="' + url.trim() + '" alt="" style="max-width:100%">';
+    // Leave alt="" selected: an empty alt is the one part of this that still
+    // needs a human, and screen readers and blocked-image views both use it.
+    ignInsert(el, markup, markup.indexOf('alt="') + 5, 0);
+  }
+</script>

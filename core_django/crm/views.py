@@ -484,6 +484,33 @@ def campaign_list(request):
     return render(request, "crm/campaign_list.html", _base(request, campaigns=campaigns))
 
 
+def _preview_contact(member):
+    """A contact to render a preview against, and whether it was invented.
+
+    Returns a real contact when there is one -- the member's own first, since
+    that is whose mail this actually is. The invented fallback matters more than
+    it looks: the footer screen used to show *no preview at all* to a member
+    with nothing assigned yet, which is precisely the member who has just joined
+    and is trying to set their signature up. "I cannot see the edits I want to
+    do" is the correct description of that screen.
+
+    The stand-in is deliberately unsaved. render() only reads fields off it, and
+    writing a fictional prospect into a shared contact pool to power a preview
+    is the kind of test data that is still there a year later.
+    """
+    real = (
+        Contact.objects.filter(assigned_to=member).first()
+        or Contact.objects.filter(assigned_to__isnull=False).first()
+    )
+    if real is not None:
+        return real, False
+
+    return Contact(
+        first_name="Rohan", last_name="Mehta", email="rohan@example.com",
+        company="Example Labs", designation="Founder",
+    ), True
+
+
 @member_required
 def campaign_detail(request, pk):
     campaign = get_object_or_404(Campaign, pk=pk)
@@ -544,9 +571,17 @@ def campaign_detail(request, pk):
 def campaign_edit(request, pk=None):
     campaign = get_object_or_404(Campaign, pk=pk) if pk else None
 
+    # "Preview" runs every check a save runs and then deliberately does not
+    # save. Until it existed, the only way to find out what "Body contains HTML"
+    # did to your markup was to save, navigate to the detail page, and navigate
+    # back to fix it -- so nobody checked, and tag mistakes were discovered by
+    # recipients. is_valid() is still called on this path, so the same red lines
+    # appear either way.
+    previewing = request.POST.get("action") == "preview"
+
     if request.method == "POST":
         form = CampaignForm(request.POST, instance=campaign)
-        if form.is_valid():
+        if form.is_valid() and not previewing:
             obj = form.save(commit=False)
             if campaign is None:
                 obj.created_by = request.member
@@ -556,8 +591,22 @@ def campaign_edit(request, pk=None):
     else:
         form = CampaignForm(instance=campaign)
 
+    # On a POST, form validation has already written the submitted subject and
+    # body onto form.instance, so this previews what was just typed rather than
+    # what is stored. That is the whole point of the button.
+    draft = form.instance if request.method == "POST" else campaign
+    sample, sample_is_fake = _preview_contact(request.member)
+    preview, preview_error = None, None
+    if draft is not None and (draft.mail_sub or draft.mail_body):
+        try:
+            preview = render_mail(draft, sample)
+        except MissingVariables as exc:
+            preview_error = str(exc)
+
     return render(request, "crm/campaign_form.html", _base(
         request, form=form, campaign=campaign,
+        preview=preview, preview_error=preview_error,
+        sample=sample, sample_is_fake=sample_is_fake,
     ))
 
 
@@ -874,28 +923,31 @@ def my_footer(request, pk):
     root = get_object_or_404(Campaign, pk=pk, parent__isnull=True)
     sub = campaign_svc.sub_campaign_for(root, request.member)
 
-    form = FooterForm(
-        request.POST or None, instance=sub, is_lead=is_lead(request.member)
-    )
-    if request.method == "POST" and form.is_valid():
+    form = FooterForm(request.POST or None, instance=sub)
+
+    # Same bargain as the campaign screen: "Preview" validates and renders but
+    # does not save, so a signature can be got right before it is attached to
+    # anything. is_valid() runs on both paths, so errors show either way.
+    previewing = request.POST.get("action") == "preview"
+    if request.method == "POST" and form.is_valid() and not previewing:
         form.save()
         messages.success(request, "Footer saved.")
         return redirect("crm:campaign_detail", pk=root.pk)
 
-    # Rendered against a real contact so the preview is what a recipient gets,
-    # not the template. Falls back to the raw footer when there is nobody to
-    # render against yet.
-    sample = Contact.objects.filter(assigned_to=request.member).first()
+    # Rendered against a contact so the preview is what a recipient gets, not
+    # the template. On a POST, validation has already written the submitted
+    # footer onto `sub`, so this shows what was just typed.
+    sample, sample_is_fake = _preview_contact(request.member)
     preview, preview_error = None, None
-    if sample:
-        try:
-            preview = render_mail(sub, sample)
-        except MissingVariables as exc:
-            preview_error = str(exc)
+    try:
+        preview = render_mail(sub, sample)
+    except MissingVariables as exc:
+        preview_error = str(exc)
 
     return render(request, "crm/footer_form.html", _base(
         request, form=form, root=root, sub=sub,
-        preview=preview, preview_error=preview_error, sample=sample,
+        preview=preview, preview_error=preview_error,
+        sample=sample, sample_is_fake=sample_is_fake,
     ))
 
 

@@ -486,17 +486,92 @@ class TestTheFooterScreen:
         sub = Campaign.objects.get(parent=root, owner=kabir)
         assert "Kabir Rao" in sub.footer
 
-    def test_a_member_cannot_set_raw_html(self, client, root, kabir):
-        """richtext.py ships without a sanitiser on the explicit grounds that
-        raw HTML is written only by leads. A member setting this would quietly
-        invalidate that argument."""
+    def test_a_member_may_set_raw_html(self, client, root, kabir):
+        """The rule this replaced was lead-only, and it did not hold up.
+
+        A member pasted the signature they use every day, the checkbox that
+        would have rendered it was not on their form, nothing said so, and every
+        mail they sent went out with the tags showing. The restriction blocked
+        working HTML rather than unsafe HTML -- richtext.validate_markup is the
+        control now, and it runs for everybody.
+        """
         self._sign_in(client, kabir)
         client.post(f"/campaigns/{root.id}/footer/", {
             "footer": "<b>Kabir</b>", "footer_is_html": "on",
         })
 
         sub = Campaign.objects.get(parent=root, owner=kabir)
-        assert sub.footer_is_html is False
+        assert sub.footer_is_html is True
+        assert sub.footer == "<b>Kabir</b>"
+
+    def test_a_members_pasted_signature_renders_instead_of_showing_its_tags(
+        self, client, root, contact, kabir
+    ):
+        """The exact shape found in production, on a real member's footer.
+
+        Trimmed but not simplified: the table, the inline styles, the mailto:
+        and the HTML comment are all things a pasted Gmail signature contains,
+        and every one of them was arriving in prospects' inboxes as text.
+        """
+        self._sign_in(client, kabir)
+        signature = (
+            '<div style="font-family: Arial, sans-serif; color: #333333;">\n'
+            "  <strong>Anushreya</strong><br>\n"
+            '  <a href="mailto:f20251539@pilani.bits-pilani.ac.in">University</a>\n'
+            '  | <a href="https://www.linkedin.com/in/anushreya/">LinkedIn</a><br>\n'
+            "  <!-- colour bar -->\n"
+            '  <table cellpadding="0" cellspacing="0" border="0" style="width:230px">\n'
+            '    <tr><td style="background-color:#f7a01d"></td></tr>\n'
+            "  </table>\n"
+            "  <span>Birla Institute of Technology &amp; Science, Pilani</span>\n"
+            "</div>"
+        )
+        response = client.post(f"/campaigns/{root.id}/footer/", {
+            "footer": signature, "footer_is_html": "on",
+        })
+
+        assert response.status_code == 302, "the signature was refused"
+        sub = Campaign.objects.get(parent=root, owner=kabir)
+        assert sub.footer_is_html is True
+
+        html = render(sub, contact).body_html
+        assert "<strong>Anushreya</strong>" in html
+        assert "&lt;strong&gt;" not in html, "tags went out as visible text"
+        assert "<table" in html and "background-color:#f7a01d" in html
+
+    def test_the_plain_fallback_of_a_signature_keeps_its_links(
+        self, root, contact, kabir
+    ):
+        """strip_tags alone turned `<a href="https://pieds.in">PIEDS</a>` into
+        the bare word "PIEDS", so the text/plain alternative -- which exists
+        precisely so a client that refuses HTML can still reach the link -- was
+        the one path where the link could not be reached."""
+        sub = campaign_svc.sub_campaign_for(root, kabir)
+        sub.footer = (
+            '<a href="https://pieds.in">PIEDS</a><br>\n'
+            '<a href="mailto:you@pilani.bits-pilani.ac.in">Email</a>'
+        )
+        sub.footer_is_html = True
+        sub.save()
+
+        plain = render(sub, contact).body
+        assert "PIEDS (https://pieds.in)" in plain
+        # The scheme is machine punctuation; the address is the useful half.
+        assert "Email (you@pilani.bits-pilani.ac.in)" in plain
+
+    def test_a_dangerous_footer_is_refused_whoever_writes_it(self, client, root, kabir):
+        """The gate that replaced the role check. If this can be saved, opening
+        the checkbox to members was a straight downgrade."""
+        self._sign_in(client, kabir)
+        for bad in ('<a href="javascript:alert(1)">x</a>',
+                    "<script>alert(1)</script>",
+                    '<iframe src="https://evil.test"></iframe>',
+                    '<div onclick="alert(1)">x</div>'):
+            response = client.post(f"/campaigns/{root.id}/footer/", {
+                "footer": bad, "footer_is_html": "on",
+            })
+            assert response.status_code == 200, f"{bad} was accepted"
+            assert Campaign.objects.get(parent=root, owner=kabir).footer == ""
 
     def test_a_lead_may_set_raw_html(self, client, root, lead):
         self._sign_in(client, lead)

@@ -14,19 +14,34 @@ weaken it.
 
 RAW MODE (`raw=True`, driven by the campaign's `is_html` checkbox, or a
 sub-campaign's `footer_is_html`) deliberately suspends that: the text is passed
-through untouched so a lead can write a divider or inline styling. The trust
-boundary moves rather than disappearing -- campaign editing is @lead_required
-and `footer_is_html` is removed from the form for non-leads for exactly this
-reason (see forms.py::FooterForm; a member's footer is always escaped). The only
-place the CRM
-renders this HTML is the campaign_detail preview, inside a `sandbox=""` iframe
-that cannot run script. Mail clients strip script themselves. CampaignForm
-additionally refuses `<script>` and inline event handlers, so the sandboxed
-preview cannot quietly disagree with what an inbox will do.
+through untouched so an author can paste the email signature they already use.
+
+`footer_is_html` used to be lead-only, on the grounds that this module ships no
+sanitiser. That rule did not survive contact with the thing it was guarding: a
+member pasted a perfectly ordinary signature -- a table, some spans, a mailto:
+link -- and every mail they sent went out with the tags visible as text, because
+the checkbox that would have rendered it was not on their form. The restriction
+did not prevent unsafe HTML; it prevented *working* HTML, and produced no error
+message while doing it.
+
+So the gate is now a gate rather than a role. `validate_markup` below is the
+control, it runs for every author, and it rejects -- loudly, at the form, with a
+message naming the tag -- the constructs that are actually dangerous or actually
+dead in a mail client: script, inline event handlers, the framing and form tags,
+`<base>`, and any `href`/`src` that is not a scheme a mail client will open.
+
+Rejecting rather than stripping is deliberate and matches the rest of this
+module: an author who is told "<iframe> is not allowed" can fix their signature,
+whereas one whose markup is silently rewritten cannot tell what happened. The
+two rendering contexts back the gate up rather than relying on it -- the CRM
+only ever shows this HTML inside a `sandbox=""` iframe, which cannot run script
+even if some construct slipped past, and mail clients strip script themselves.
+That is what keeps the preview honest about what an inbox will do.
 """
 
 import html
 import re
+from html.parser import HTMLParser
 
 from django.core.exceptions import ValidationError
 from django.core.validators import URLValidator
@@ -96,21 +111,262 @@ def validate_links(text: str) -> list[str]:
 _SCRIPT_RE = re.compile(r"<\s*script\b", re.I)
 _HANDLER_RE = re.compile(r"<[^>]*?\son[a-z]+\s*=", re.I | re.S)
 
+#: Attributes whose value is a URL, so raw HTML gets the same link checking the
+#: markdown syntax has had since links landed. Without this, `[x](javascript:1)`
+#: was refused and `<a href="javascript:1">x</a>` sailed through -- the same
+#: link, written two ways, judged by two different standards.
+URL_ATTRS = frozenset({"href", "src", "background", "action", "poster",
+                       "formaction", "cite"})
+
+#: Schemes a hand-written `href` may use. Wider than ALLOWED_SCHEMES on purpose.
+#: The markdown syntax is our own invention and we chose to keep it to the web;
+#: a pasted signature is exactly where `mailto:` and `tel:` legitimately live,
+#: and refusing them would reject essentially every real signature.
+HREF_SCHEMES = frozenset({"http", "https", "mailto", "tel"})
+
+#: `src` is narrower: an image cannot usefully be a mailto:. `cid:` is how an
+#: inline attachment is referenced, and `data:image/` how a small logo is
+#: embedded without one -- neither can carry script. Any OTHER data: type can,
+#: which is why the check below tests the prefix and not merely the scheme.
+SRC_SCHEMES = frozenset({"http", "https", "cid"})
+
+#: Attributes that point at something to display rather than somewhere to go.
+_MEDIA_ATTRS = frozenset({"src", "background", "poster"})
+
+#: Tags a mail client will drop, refuse, or sandbox. Rejected for the same
+#: reason as <script>: allowing them means the preview shows something no
+#: recipient gets. <base> is the one that is actively dangerous rather than
+#: merely useless -- it silently repoints every other URL in the mail.
+FORBIDDEN_TAGS = {
+    "iframe": "no mail client renders a frame",
+    "frame": "no mail client renders a frame",
+    "frameset": "no mail client renders a frame",
+    "object": "no mail client renders embedded objects",
+    "embed": "no mail client renders embedded objects",
+    "applet": "no mail client renders embedded objects",
+    "form": "mail clients strip forms; a link to a real page is the way to "
+            "collect a reply",
+    "base": "it silently repoints every other link in the mail",
+    "meta": "mail clients strip document metadata",
+    "link": "mail clients strip external stylesheets; use style=\"...\" on the "
+            "tag itself",
+    "svg": "Gmail and Outlook both strip inline SVG; use a PNG",
+    "math": "mail clients strip inline MathML",
+}
+
+#: CSS that has historically been a script vector. Mail clients strip all three;
+#: they are listed so the preview cannot show behaviour an inbox will not.
+_CSS_DANGER_RE = re.compile(r"expression\s*\(|-moz-binding|behaviou?r\s*:", re.I)
+
+
+class _TagCollector(HTMLParser):
+    """Every start tag and its attributes, in document order.
+
+    HTMLParser rather than a regex because this feeds *rejection messages*. A
+    regex that mistakes `<a href="x">` inside a code sample for a real anchor
+    produces an error the author cannot act on, and one that misses a tag split
+    across two lines produces silence exactly where a message was needed.
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.tags: list[tuple[str, list[tuple[str, str | None]]]] = []
+
+    def handle_starttag(self, tag, attrs):
+        self.tags.append((tag, attrs))
+
+    #: `<img ... />` is a start tag for our purposes; without this it is missed.
+    handle_startendtag = handle_starttag
+
+
+def _tags(text: str) -> list[tuple[str, list[tuple[str, str | None]]]]:
+    """Parse `text` as an HTML fragment. Never raises.
+
+    A parse failure must not become a 500 inside form validation: whatever was
+    recognised before the failure is still worth checking, and the tag that
+    broke the parser is not something we were going to render usefully anyway.
+    """
+    parser = _TagCollector()
+    try:
+        parser.feed(text or "")
+        parser.close()
+    except Exception:       # pragma: no cover - HTMLParser is lenient by design
+        pass
+    return parser.tags
+
+
+def _scheme_of(url: str) -> str:
+    """The URL's scheme, or "" if it has none.
+
+    Split on the first `/`, `?` or `#` before looking for the colon: in
+    `logo.png?w=1:2` the colon is inside a query string, and reading it as a
+    scheme would report a nonexistent problem.
+    """
+    head = re.split(r"[/?#]", url, maxsplit=1)[0]
+    return head.split(":", 1)[0].lower() if ":" in head else ""
+
+
+def extract_html_links(text: str) -> list[tuple[str, str, str]]:
+    """Every (tag, attribute, url) that raw HTML points at, in order."""
+    found = []
+    for tag, attrs in _tags(text):
+        for name, value in attrs:
+            if name in URL_ATTRS and value and value.strip():
+                found.append((tag, name, value.strip()))
+    return found
+
+
+def validate_html_urls(text: str) -> list[str]:
+    """Problems with the URLs inside raw HTML -- `href`, `src` and friends.
+
+    Same bargain as `validate_links`: a dead logo or an unopenable link caught
+    here is a red line under a text box; caught at send time it is already
+    sitting in a prospect's inbox.
+    """
+    problems: list[str] = []
+
+    for tag, attr, url in extract_html_links(text):
+        # Resolved per contact at send time, exactly as in validate_links.
+        if "{{" in url:
+            continue
+
+        # A bare fragment is the conventional "this link goes nowhere on
+        # purpose" placeholder. Dead in a mail, but harmless and deliberate.
+        if url == "#":
+            continue
+
+        scheme = _scheme_of(url)
+        media = attr in _MEDIA_ATTRS
+
+        if not scheme:
+            problems.append(
+                f'<{tag} {attr}="{url}"> is a relative URL. A mail has no page '
+                f"to be relative to, so it will not resolve for anyone -- use a "
+                f"full https:// address."
+            )
+            continue
+
+        if media and scheme == "data":
+            if not url.lower().startswith("data:image/"):
+                problems.append(
+                    f"<{tag} {attr}=...> uses a data: URL that is not an image. "
+                    f"Only data:image/... is allowed."
+                )
+            continue
+
+        allowed = SRC_SCHEMES if media else HREF_SCHEMES
+        if scheme not in allowed:
+            problems.append(
+                f"<{tag} {attr}=...> uses the {scheme}: scheme, which is not "
+                f"allowed here. Use " + " or ".join(f"{s}:" for s in sorted(allowed)) + "."
+            )
+
+    return problems
+
+
+#: Tags ordinary enough in a pasted signature that finding one in a footer whose
+#: HTML box is OFF means a mistake rather than prose. Deliberately a list of
+#: real tag names and not "does it contain a < ": a footer reading "priced at
+#: <5 lakh" is not markup, and neither is an address in angle brackets.
+_SIGNATURE_TAGS = frozenset({
+    "a", "b", "big", "blockquote", "br", "center", "div", "em", "font", "h1",
+    "h2", "h3", "h4", "h5", "h6", "hr", "i", "img", "li", "ol", "p", "small",
+    "span", "strong", "sub", "sup", "table", "tbody", "td", "tfoot", "th",
+    "thead", "tr", "u", "ul",
+})
+
+
+def looks_like_html(text: str) -> bool:
+    """Whether `text` is markup somebody forgot to tick the HTML box for.
+
+    The entire defect this module was reworked for, reduced to a question the
+    form can ask. A member pasted a signature, left the box unticked because it
+    was not on their form, and mailed the tags to real prospects. The box is on
+    their form now -- this is what stops the same mail going out when they
+    simply forget to tick it.
+    """
+    return any(tag in _SIGNATURE_TAGS for tag, _ in _tags(text))
+
 
 def validate_markup(text: str) -> list[str]:
-    """Problems with raw HTML in a body. Only consulted when `is_html` is on."""
+    """Problems with raw HTML in a body or footer.
+
+    Only consulted when the author ticked the HTML box -- without it the text is
+    escaped, so `<script>` there is literal characters and harmless.
+
+    This is the gate that replaced "raw HTML is lead-only"; see the module
+    docstring. It rejects rather than strips, so an author is told which tag to
+    remove instead of watching their signature quietly change shape.
+    """
     problems = []
-    if _SCRIPT_RE.search(text or ""):
+    text = text or ""
+
+    if _SCRIPT_RE.search(text):
         problems.append(
             "<script> is not allowed: every mail client strips it, so it would "
             "only make the preview lie about what recipients see."
         )
-    if _HANDLER_RE.search(text or ""):
+    if _HANDLER_RE.search(text):
         problems.append(
             "Inline event handlers (onclick=, onload=, ...) are not allowed, "
             "for the same reason as <script>."
         )
+
+    # One message per distinct tag, however many times it appears: five
+    # <iframe>s are one thing to fix, not five.
+    reported: set[str] = set()
+    for tag, attrs in _tags(text):
+        if tag in FORBIDDEN_TAGS and tag not in reported:
+            reported.add(tag)
+            problems.append(f"<{tag}> is not allowed: {FORBIDDEN_TAGS[tag]}.")
+
+        for name, value in attrs:
+            if name == "style" and value and _CSS_DANGER_RE.search(value):
+                problems.append(
+                    f"The style= on <{tag}> uses CSS that mail clients strip as "
+                    f"a script vector (expression(), behavior:, -moz-binding)."
+                )
+
+    problems.extend(validate_html_urls(text))
     return problems
+
+
+#: `<a href="URL">label</a>`, for the text/plain alternative. Deliberately
+#: tolerant of anything between the tags -- `<a><strong>x</strong></a>` is
+#: ordinary in a pasted signature, and strip_tags cleans the remains anyway.
+_ANCHOR_RE = re.compile(
+    r"""<a\b[^>]*?\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))[^>]*>(.*?)</a\s*>""",
+    re.I | re.S,
+)
+
+#: Any run of three or more newlines. A signature built from block elements
+#: leaves one blank line per stripped tag, so the fallback arrives as a column
+#: of whitespace with a name at the bottom unless this is collapsed.
+_BLANK_RUN_RE = re.compile(r"\n{3,}")
+
+
+def _anchor_to_text(match: "re.Match[str]") -> str:
+    """`<a href="https://x">book</a>` -> `book (https://x)`."""
+    url = (match.group(1) or match.group(2) or match.group(3) or "").strip()
+    label = html.unescape(strip_tags(match.group(4) or "")).strip()
+
+    # `mailto:someone@x.com (mailto:someone@x.com)` reads as a bug. The address
+    # is the useful half; the scheme is machine punctuation.
+    if url.lower().startswith("mailto:"):
+        url = url[len("mailto:"):]
+
+    if not label:
+        return url
+    # Already self-describing -- "https://pieds.in (https://pieds.in)" is noise.
+    if not url or url in label:
+        return label
+    return f"{label} ({url})"
+
+
+def _tidy(text: str) -> str:
+    """Trailing spaces off every line, and no run of blank lines longer than one."""
+    lines = [line.rstrip() for line in text.splitlines()]
+    return _BLANK_RUN_RE.sub("\n\n", "\n".join(lines)).strip("\n")
 
 
 def to_plain(text: str, raw: bool = False) -> str:
@@ -122,10 +378,18 @@ def to_plain(text: str, raw: bool = False) -> str:
     In raw mode the body is markup, so the tags come out and their entities go
     back to being characters -- a fallback full of `<td>` and `&amp;` reads
     worse than no fallback at all.
+
+    **Anchors get the same treatment as the markdown syntax, and for the same
+    reason.** `strip_tags` alone turned `<a href="https://pieds.in">PIEDS</a>`
+    into the bare word "PIEDS", so every link in a raw-HTML body or a pasted
+    signature was unreachable for exactly the readers this alternative exists to
+    serve -- the promise in the paragraph above, quietly broken on the one path
+    that did not go through LINK_RE.
     """
     plain = LINK_RE.sub(lambda m: f"{m.group(1).strip()} ({m.group(2)})", text or "")
     if raw:
-        plain = html.unescape(strip_tags(plain))
+        plain = _ANCHOR_RE.sub(_anchor_to_text, plain)
+        plain = _tidy(html.unescape(strip_tags(plain)))
     return plain
 
 

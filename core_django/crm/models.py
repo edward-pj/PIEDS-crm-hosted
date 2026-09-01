@@ -530,11 +530,13 @@ class Campaign(TimeStampedModel):
 
     #: Independent of the root's `is_html` -- a plain-text body can carry a
     #: styled footer and vice versa, which is why render.py converts the two
-    #: parts separately. Lead-only in the form: richtext's no-sanitiser design
-    #: rests on raw HTML being written only by leads.
+    #: parts separately. Offered to every member, not only leads: the lead-only
+    #: rule blocked working HTML rather than unsafe HTML, and
+    #: richtext.validate_markup is the control now. See forms.py::FooterForm.
     footer_is_html = models.BooleanField(
         default=False,
-        help_text="Write the footer as raw HTML. Leads only.",
+        help_text="Paste the signature you already use. Off, tags go out as "
+                  "visible text.",
     )
 
     class Meta:

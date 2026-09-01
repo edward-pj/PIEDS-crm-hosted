@@ -6,7 +6,7 @@ from shared.enums import ContactLifecycle
 from .models import Campaign, Contact, ContactNote, TeamMember
 from .services.campaigns import ALLOWED_VARIABLES, extract_placeholders, validate_footer
 from .services.contacts import clean_tags
-from .services.richtext import validate_links, validate_markup
+from .services.richtext import looks_like_html, validate_links, validate_markup
 from .services.permissions import assignable_members, can_set_lifecycle, is_lead
 
 
@@ -114,23 +114,26 @@ class FooterForm(BasecoatMixin, forms.ModelForm):
     Not a cut-down CampaignForm: a sub-campaign owner has no business touching
     the subject, the body or the variables, and a form that merely hides those
     fields still round-trips them through a crafted POST.
+
+    **`footer_is_html` is offered to every member, not only to leads.** It was
+    lead-only, because richtext.py shipped no sanitiser and the argument ran
+    that raw HTML should therefore be written only by leads. What that actually
+    produced was a member pasting the signature they use every day -- a table, a
+    few spans, a mailto: link -- and mailing it to real prospects with the tags
+    showing, because the checkbox that would have rendered it was not on their
+    form and nothing said so. The rule blocked working HTML rather than unsafe
+    HTML. `richtext.validate_markup` is now a real gate that runs for every
+    author regardless of role, which is the control this was standing in for.
     """
 
     class Meta:
         model = Campaign
         fields = ["footer", "footer_is_html"]
-        widgets = {"footer": forms.Textarea(attrs={"rows": 6})}
+        # Twelve rows, not six: a real signature is a dozen lines of markup,
+        # and editing one through a six-line window is most of why "I cannot see
+        # what I am doing" was a fair complaint.
+        widgets = {"footer": forms.Textarea(attrs={"rows": 12})}
         labels = {"footer_is_html": "Footer contains HTML"}
-
-    def __init__(self, *args, is_lead=False, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.is_lead = is_lead
-        if not is_lead:
-            # Removed, not disabled. richtext.py ships without an HTML sanitiser
-            # on the explicit grounds that raw HTML is written only by leads --
-            # so letting a member set this would quietly invalidate that
-            # argument, and a disabled field is not a control.
-            self.fields.pop("footer_is_html")
 
     def clean_footer(self):
         footer = self.cleaned_data.get("footer") or ""
@@ -138,15 +141,35 @@ class FooterForm(BasecoatMixin, forms.ModelForm):
             validate_footer(footer)
         except ValidationError as exc:
             raise forms.ValidationError(exc.messages)
-        for problem in validate_links(footer):
-            raise forms.ValidationError(problem)
+
+        # Every problem, not just the first. `raise` inside the loop reported
+        # one bad link per save, so a signature with three of them took three
+        # round trips to fix -- and each trip looked like a fresh failure.
+        problems = validate_links(footer)
+        if problems:
+            raise forms.ValidationError(problems)
         return footer
 
     def clean(self):
         cleaned = super().clean()
+        footer = cleaned.get("footer") or ""
+
         if cleaned.get("footer_is_html"):
-            for problem in validate_markup(cleaned.get("footer") or ""):
+            for problem in validate_markup(footer):
                 self.add_error("footer", problem)
+
+        # The defect itself, caught at the form. Tags with the box unticked go
+        # out as visible text, and until now nothing said so -- the mail simply
+        # arrived wrong, and the sender found out from a recipient or not at
+        # all. Attached to the checkbox rather than the textarea because the
+        # checkbox is where the fix is.
+        elif looks_like_html(footer):
+            self.add_error(
+                "footer_is_html",
+                "This footer contains HTML tags. Tick this box to render them "
+                "— left unticked, they go out as visible text in the mail. If "
+                "you meant them literally, remove the angle brackets.",
+            )
         return cleaned
 
 

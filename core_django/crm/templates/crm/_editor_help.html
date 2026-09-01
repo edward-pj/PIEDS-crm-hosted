@@ -1,0 +1,63 @@
+{% comment %}
+The reference panel for anything that writes mail markup -- the campaign body
+and the member footer both include it.
+
+Shared rather than copied because it documents the rules richtext.py enforces,
+and two copies would start disagreeing with each other the first time one of
+those rules changed. `what` names the field in prose so the same panel can say
+"body" on one screen and "footer" on the other.
+{% endcomment %}
+<p class="muted"><strong>Links</strong></p>
+<p class="muted">
+  Select the words you want clickable and press <em>Insert link</em>, or type
+  the syntax yourself:
+</p>
+<p class="text-xs font-mono muted">[book a call](https://cal.com/you)</p>
+<p class="text-xs muted">
+  The recipient sees <em>book a call</em> as a link. This works whether or not
+  HTML is on. Mail goes out as HTML with a plain-text fallback, so clients that
+  block HTML still get the URL in brackets.
+</p>
+
+<hr style="border:0;border-top:1px solid var(--color-border);margin:.25rem 0">
+
+<p class="muted"><strong>HTML</strong></p>
+<p class="muted">
+  Tick <em>{{ html_label }}</em> to write your own markup &mdash; a signature, a
+  divider, inline styling. Paste the signature you already use:
+</p>
+<p class="text-xs font-mono muted">
+  &lt;strong&gt;Anushreya&lt;/strong&gt;&lt;br&gt;<br>
+  &lt;span style="color:#555"&gt;PIEDS, BITS Pilani&lt;/span&gt;&lt;br&gt;<br>
+  &lt;a href="mailto:you@pilani.bits-pilani.ac.in"&gt;Email&lt;/a&gt;
+</p>
+<p class="text-xs muted">
+  With it on, <strong>you</strong> control line breaks &mdash; write
+  <code>&lt;br&gt;</code> or <code>&lt;p&gt;</code>, because blank lines no
+  longer become spacing on their own. Leave it off and your {{ what }} is
+  ordinary text: every tag shows up as literal <code>&lt;tags&gt;</code> in the
+  recipient's inbox.
+</p>
+
+<hr style="border:0;border-top:1px solid var(--color-border);margin:.25rem 0">
+
+<p class="muted"><strong>Images</strong></p>
+<p class="text-xs muted">
+  Needs HTML on. The image has to be somewhere public on the web &mdash; a mail
+  has no page to be relative to, so <code>logo.png</code> resolves for nobody:
+</p>
+<p class="text-xs font-mono muted">
+  &lt;img src="https://pieds.in/logo.png" alt="PIEDS" width="120"&gt;
+</p>
+
+<hr style="border:0;border-top:1px solid var(--color-border);margin:.25rem 0">
+
+<p class="muted"><strong>What gets refused</strong></p>
+<p class="text-xs muted">
+  <code>&lt;script&gt;</code>, <code>onclick=</code> and friends,
+  <code>&lt;iframe&gt;</code>, <code>&lt;form&gt;</code>,
+  <code>&lt;style&gt;</code> sheets, and any link that is not
+  <code>http</code>, <code>https</code>, <code>mailto</code> or
+  <code>tel</code>. Every mail client strips these, so allowing them would only
+  let this preview show you something no recipient ever sees.
+</p>

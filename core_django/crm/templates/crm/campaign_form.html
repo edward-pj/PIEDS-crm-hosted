@@ -6,36 +6,84 @@
 <form method="post" class="split">
   {% csrf_token %}
 
-  <div class="card">
-    <section class="col">
-      {% for field in form %}
-        <div class="col" style="gap:.35rem">
-          {% if field.name == 'is_html' %}
-            {# A checkbox reads as a checkbox: control first, label beside it. #}
-            <div class="row" style="gap:.5rem">
-              {{ field }}
-              <label class="label" for="{{ field.id_for_label }}">{{ field.label }}</label>
-            </div>
-          {% else %}
-            <label class="label" for="{{ field.id_for_label }}">{{ field.label }}</label>
-            {% if field.name == 'mail_body' or field.name == 'mail_sub' %}
-              <div class="row" style="gap:.4rem">
-                <button type="button" class="btn-outline btn-sm"
-                        onclick="insertLink('{{ field.id_for_label }}')">Insert link</button>
-                <span class="text-xs muted">Select the words you want to link, then click.</span>
+  <div class="col" style="gap:1rem">
+    <div class="card">
+      <section class="col">
+        {% for field in form %}
+          <div class="col" style="gap:.35rem">
+            {% if field.name == 'is_html' %}
+              {# A checkbox reads as a checkbox: control first, label beside it. #}
+              <div class="row" style="gap:.5rem">
+                {{ field }}
+                <label class="label" for="{{ field.id_for_label }}">{{ field.label }}</label>
               </div>
+              <p class="text-xs muted">
+                Off, the body is plain text and every tag shows up literally in
+                the recipient's inbox. On, you write the markup and it renders.
+              </p>
+            {% else %}
+              <label class="label" for="{{ field.id_for_label }}">{{ field.label }}</label>
+              {% if field.name == 'mail_body' or field.name == 'mail_sub' %}
+                <div class="row wrap" style="gap:.4rem">
+                  <button type="button" class="btn-outline btn-sm"
+                          onclick="insertLink('{{ field.id_for_label }}')">Insert link</button>
+                  {% if field.name == 'mail_body' %}
+                    <button type="button" class="btn-outline btn-sm"
+                            onclick="insertImage('{{ field.id_for_label }}', 'id_is_html')">Insert image</button>
+                  {% endif %}
+                  <span class="text-xs muted">Select the words you want to link, then click.</span>
+                </div>
+              {% endif %}
+              {{ field }}
             {% endif %}
-            {{ field }}
-          {% endif %}
-          {% if field.help_text %}<p class="text-xs muted">{{ field.help_text }}</p>{% endif %}
-          {% for e in field.errors %}<p class="text-xs s-FAILED">{{ e }}</p>{% endfor %}
+            {% if field.help_text %}<p class="text-xs muted">{{ field.help_text }}</p>{% endif %}
+            {% for e in field.errors %}<p class="text-xs s-FAILED">{{ e }}</p>{% endfor %}
+          </div>
+        {% endfor %}
+        <div class="row wrap">
+          <button type="submit" class="btn">Save</button>
+          {# Validates and renders without writing anything. Until this existed,
+             seeing what a tag did meant saving, navigating to the detail page,
+             and navigating back to fix it -- so nobody looked. #}
+          <button type="submit" name="action" value="preview" class="btn-outline">
+            Preview
+          </button>
+          <a class="btn-ghost" href="{% url 'crm:campaign_list' %}">Cancel</a>
         </div>
-      {% endfor %}
-      <div class="row">
-        <button type="submit" class="btn">Save</button>
-        <a class="btn-ghost" href="{% url 'crm:campaign_list' %}">Cancel</a>
+      </section>
+    </div>
+
+    {% if preview or preview_error %}
+      <div class="card">
+        <header>
+          <h2>Preview</h2>
+          {% if sample_is_fake %}
+            <p class="muted text-sm">
+              Sample data — no contacts are assigned yet, so {{ sample.full_name }}
+              at {{ sample.company }} stands in for a real one.
+            </p>
+          {% else %}
+            <p class="muted text-sm">As {{ sample.full_name }} at {{ sample.company }} would receive it.</p>
+          {% endif %}
+        </header>
+        <section>
+          {% if preview_error %}
+            <div class="alert alert-destructive"><section><p>{{ preview_error }}</p></section></div>
+          {% else %}
+            <p class="text-sm muted">{{ preview.subject }}</p>
+            {# sandbox="" removes every capability, including script -- the same
+               frame the campaign detail page uses, for the same reason. #}
+            <iframe sandbox="" srcdoc="{{ preview.body_html }}"
+                    style="width:100%;height:26rem;border:1px solid var(--color-border,#ddd);border-radius:.5rem;background:#fff"
+                    title="Mail body preview"></iframe>
+            <details class="mt-2">
+              <summary class="text-sm muted">Plain-text version</summary>
+              <pre class="text-xs preview" style="white-space:pre-wrap;overflow-x:auto">{{ preview.body }}</pre>
+            </details>
+          {% endif %}
+        </section>
       </div>
-    </section>
+    {% endif %}
   </div>
 
   <div class="card sticky">
@@ -55,73 +103,17 @@
         That check is what stops 200 mails going out saying
         {% verbatim %}&ldquo;Dear {{ first_name }}&rdquo;{% endverbatim %}.
       </p>
-
-      <hr style="border:0;border-top:1px solid var(--color-border);margin:.25rem 0">
-
-      <p class="muted"><strong>Links</strong></p>
-      <p class="muted">
-        Select the words you want clickable and press <em>Insert link</em>, or
-        type the syntax yourself:
-      </p>
-      <p class="text-xs font-mono muted">[book a call](https://cal.com/you)</p>
       <p class="text-xs muted">
-        The recipient sees <em>book a call</em> as a link. Mail goes out as HTML
-        with a plain-text fallback, so clients that block HTML still get the URL.
-        Only <code>http://</code> and <code>https://</code> links are allowed.
+        Placeholders belong to the campaign, not to a footer &mdash; a signature
+        is the same text for everyone, so it may not use them.
       </p>
 
       <hr style="border:0;border-top:1px solid var(--color-border);margin:.25rem 0">
 
-      <p class="muted"><strong>HTML bodies</strong></p>
-      <p class="muted">
-        Tick <em>Body contains HTML</em> to write your own markup &mdash; a
-        footer, a divider, inline styling:
-      </p>
-      <p class="text-xs font-mono muted">
-        &lt;p&gt;Hi {% verbatim %}{{ first_name }}{% endverbatim %},&lt;/p&gt;<br>
-        &lt;hr&gt;<br>
-        &lt;footer style="color:#888"&gt;PIEDS, BITS Pilani&lt;/footer&gt;
-      </p>
-      <p class="text-xs muted">
-        With it on, <strong>you</strong> control line breaks &mdash; write
-        <code>&lt;br&gt;</code> or <code>&lt;p&gt;</code>, because blank lines no
-        longer become spacing on their own. Keep to inline styles and simple
-        tags; mail clients ignore <code>&lt;style&gt;</code> blocks, and
-        <code>&lt;script&gt;</code> is rejected because no inbox would run it.
-      </p>
+      {% include "crm/_editor_help.html" with what="body" html_label="Body contains HTML" %}
     </section>
   </div>
 </form>
 {% endblock %}
 
-{% block scripts %}
-<script>
-  // Wrap the selected words in [text](url). Deliberately a prompt() and not a
-  // modal: this codebase carries no JS framework, and a native prompt is the
-  // whole feature in three lines instead of a dialog library.
-  function insertLink(fieldId) {
-    const el = document.getElementById(fieldId);
-    if (!el) return;
-
-    const start = el.selectionStart, end = el.selectionEnd;
-    const selected = el.value.slice(start, end).trim();
-
-    const url = prompt('Link URL (must start with http:// or https://)', 'https://');
-    if (!url) return;
-
-    const label = selected || 'link text';
-    const markup = '[' + label + '](' + url.trim() + ')';
-    el.value = el.value.slice(0, start) + markup + el.value.slice(end);
-
-    // With nothing selected we invented the label, so leave it selected for
-    // the user to type over rather than dropping the caret at the end.
-    el.focus();
-    if (selected) {
-      el.selectionStart = el.selectionEnd = start + markup.length;
-    } else {
-      el.selectionStart = start + 1;
-      el.selectionEnd = start + 1 + label.length;
-    }
-  }
-</script>
-{% endblock %}
+{% block scripts %}{% include "crm/_editor_js.html" %}{% endblock %}
