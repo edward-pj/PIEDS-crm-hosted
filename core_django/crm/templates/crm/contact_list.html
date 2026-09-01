@@ -80,19 +80,36 @@
 
 <script>
 (function () {
-  const all = document.getElementById('check-all');
   const panel = document.getElementById('bulk-panel');
   const count = document.getElementById('bulk-count');
   const rows = () => Array.from(document.querySelectorAll('.row-check'));
 
   function sync() {
-    const n = rows().filter(r => r.checked).length;
+    const all = rows(), n = all.filter(r => r.checked).length;
     count.textContent = n;
     panel.hidden = n === 0;
+
+    // Looked up fresh every time: the poll swap replaces the <thead>, so a
+    // reference held from page load points at a detached node.
+    const master = document.getElementById('check-all');
+    if (master) {
+      master.checked = n > 0 && n === all.length;
+      master.indeterminate = n > 0 && n < all.length;
+    }
   }
-  all?.addEventListener('change', () => { rows().forEach(r => r.checked = all.checked); sync(); });
-  document.addEventListener('change', e => { if (e.target.matches('.row-check')) sync(); });
-  // The polled swap replaces the rows, so recount whatever survived it.
+
+  // Delegated for the same reason as the row boxes: `check-all` lives inside
+  // the [data-poll] region, so a background refresh replaced the element and
+  // took a directly-bound listener with it -- select-all then did nothing
+  // until the page was reloaded.
+  document.addEventListener('change', e => {
+    if (e.target.id === 'check-all') {
+      rows().forEach(r => r.checked = e.target.checked);
+      sync();
+    } else if (e.target.matches('.row-check')) {
+      sync();
+    }
+  });
   document.addEventListener('poll:refreshed', sync);
   sync();
 
