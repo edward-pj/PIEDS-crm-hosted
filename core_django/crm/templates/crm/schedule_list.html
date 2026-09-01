@@ -2,9 +2,10 @@
 {% block title %}Scheduled sends — Ignite CRM{% endblock %}
 {% block heading %}Scheduled sends{% endblock %}
 
-{# Every member, not just leads. While the scheduler is deferred this button
+{% comment %} Every member, not just leads. While the scheduler is deferred this button
    is the send path, and a member who cannot press it cannot send at all. See
-   views.run_queue for why widening it grants no new power. #}
+   views.run_queue for why widening it grants no new power.
+{% endcomment %}
 {% block actions %}
   <form method="post" action="{% url 'crm:run_queue' %}">
     {% csrf_token %}
@@ -26,8 +27,9 @@
   </section>
 </div>
 
-{# Attention first. A job nothing executed is the failure mode this whole page
-   exists for, and burying it under a paginated table would defeat the point. #}
+{% comment %} Attention first. A job nothing executed is the failure mode this whole page
+   exists for, and burying it under a paginated table would defeat the point.
+{% endcomment %}
 {% if needs_attention %}
   <div class="alert alert-destructive mb-3">
     <section>

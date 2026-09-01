@@ -3,8 +3,9 @@
 {% block heading %}Dashboard{% endblock %}
 
 {% block content %}
-{# One stable [data-poll] wrapper: the failures card below is conditional, and
-   a container count that changes between loads would abort the swap. #}
+{% comment %} One stable [data-poll] wrapper: the failures card below is conditional, and
+   a container count that changes between loads would abort the swap.
+{% endcomment %}
 <div data-poll>
 
 {% if not gmail_connected %}

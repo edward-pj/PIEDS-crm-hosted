@@ -20,8 +20,9 @@
 </div>
 
 {% if counts.stranded %}
-  {# The failure that reads as success: an interrupted batch leaves claimed
-     contacts that look like activity and will never move on their own. #}
+  {% comment %} The failure that reads as success: an interrupted batch leaves claimed
+     contacts that look like activity and will never move on their own.
+{% endcomment %}
   <div class="alert alert-destructive mb-3">
     <section>
       <p>
@@ -104,10 +105,11 @@
         <div class="preview mb-2">{{ preview.subject }}</div>
         <div class="text-xs muted mb-1">Body</div>
         {% if preview.body_html %}
-          {# The real HTML mail, in an iframe rather than injected into this
+          {% comment %} The real HTML mail, in an iframe rather than injected into this
              page: it renders the exact document Gmail will carry, isolated
              from the CRM's own CSS. srcdoc is auto-escaped by Django, and the
-             sandbox is belt-and-braces -- to_html() emits no script. #}
+             sandbox is belt-and-braces -- to_html() emits no script.
+{% endcomment %}
           <iframe class="preview preview-frame" sandbox="" title="Mail body preview"
                   srcdoc="{{ preview.body_html }}"></iframe>
           <details class="mt-1">
